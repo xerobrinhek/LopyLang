@@ -1,7 +1,9 @@
+mod ast;
 mod codegen;
 
 use std::fs;
 use std::path::PathBuf;
+use crate::ast::*;
 
 // ---- Токены ----
 #[derive(Debug, PartialEq, Clone)]
@@ -15,6 +17,7 @@ pub enum Token {
 
     // Идентификаторы и литералы
     Identifier(String),
+    String(String),
     Number(i64),
 
     // Символы
@@ -26,6 +29,9 @@ pub enum Token {
     RParen,     // )
     LBrace,     // {
     RBrace,     // }
+    Star,       // *
+    Slash,      // /
+    Comma,      // ,
 
     // Специальные
     EOF,
@@ -100,6 +106,28 @@ impl Lexer {
                 self.pos += 1;
                 Token::Minus
             }
+            '"' => {
+                self.pos += 1;
+                let start = self.pos;
+                while self.pos < self.input.len() && self.input[self.pos] != '"' {
+                    self.pos += 1;
+                }
+                let s: String = self.input[start..self.pos].iter().collect();
+                self.pos += 1; // пропустить закрывающую кавычку
+                Token::String(s)
+            }
+            ',' => {
+                self.pos += 1;
+                Token::Comma
+            }
+            '*' => {
+                self.pos += 1;
+                Token::Star
+            }
+            '/' => {
+                self.pos += 1;
+                Token::Slash
+            }
             ';' => {
                 self.pos += 1;
                 Token::Semicolon
@@ -131,8 +159,7 @@ impl Lexer {
 fn main() {
     let source = r#"
 fn main() {
-    let x = 5;
-    let y = 10;
+    println("РАБОТАЕТ СУКА!!!!!");
 }
 "#;
     let mut lexer = Lexer::new(source);
@@ -148,28 +175,9 @@ fn main() {
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program();
     println!("AST:\n{:#?}", program);
-}
 
-// AST узлы
-#[derive(Debug)]
-struct Program {
-    functions: Vec<Function>,
-}
-
-#[derive(Debug)]
-struct Function {
-    name: String,
-    body: Vec<Statement>,
-}
-
-#[derive(Debug)]
-enum Statement {
-    Let { name: String, value: Expression },
-}
-
-#[derive(Debug)]
-enum Expression {
-    Number(i64),
+    let ir = codegen::generate(&program);
+    println!("\nLLVM IR:\n{}", ir);
 }
 
 struct Parser {
@@ -228,18 +236,71 @@ impl Parser {
                 self.expect(Token::Semicolon);
                 Statement::Let { name, value }
             }
+            Token::Identifier(name) if name == "println" => {
+                self.advance(); // eat 'println'
+                self.expect(Token::LParen);
+                let mut values = Vec::new();
+                while self.current_token() != Token::RParen {
+                    values.push(self.parse_expression());
+                    if let Token::Comma = self.current_token() {
+                        self.advance(); // eat ','
+                    }
+                }
+                self.expect(Token::RParen);
+                self.expect(Token::Semicolon);
+                Statement::Println { values }
+            }
             _ => panic!("Неизвестное выражение"),
         }
     }
 
     fn parse_expression(&mut self) -> Expression {
+        self.parse_additive()
+    }
+
+    fn parse_additive(&mut self) -> Expression {
+        let mut left = self.parse_multiplicative();
+        while let Token::Plus = self.current_token() {
+            self.advance(); // eat '+'
+            let right = self.parse_multiplicative();
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::Add,
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_multiplicative(&mut self) -> Expression {
+        let mut left = self.parse_primary();
+        while let Token::Star = self.current_token() {
+            self.advance(); // eat '*'
+            let right = self.parse_primary();
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::Mul,
+                right: Box::new(right),
+            };
+        }
+        left
+    }
+
+    fn parse_primary(&mut self) -> Expression {
         match self.current_token() {
             Token::Number(n) => {
-                let num = n;
                 self.advance();
-                Expression::Number(num)
+                Expression::Number(n)
             }
-            _ => panic!("Ожидалось число"),
+            Token::Identifier(name) => {
+                self.advance();
+                Expression::Variable(name.clone())
+            }
+            Token::String(s) => {
+                self.advance();
+                Expression::StringLit(s)
+            }
+            _ => panic!("Ожидалось число или переменная, получено: {:?}", self.current_token()),
         }
     }
 
