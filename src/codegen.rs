@@ -1,7 +1,7 @@
 use crate::ast::*;
 use std::collections::HashMap;
 
-pub fn generate(program: &Program) -> String {
+pub fn generate(program: &mut Program) -> String {
     let mut ir = String::new();
     let mut string_counter = 0;
     let mut strings = String::new();
@@ -19,6 +19,7 @@ pub fn generate(program: &Program) -> String {
     ir.push_str("declare void @exit(i32)\n");
     ir.push_str("declare i32 @sprintf(i8*, i8*, ...)\n");
     ir.push_str("declare i8* @fgets(i8*, i32, i8*)\n\n");
+    ir.push_str("declare i64 @llvm.readcyclecounter()\n");
 
     ir.push_str("@.str.true_val = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n");
     ir.push_str("@.str.false_val = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n");
@@ -30,6 +31,22 @@ pub fn generate(program: &Program) -> String {
     ir.push_str("@.input_error_bool = private unnamed_addr constant [31 x i8] c\"Error: expected true or false\\0A\\00\", align 1\n");
     ir.push_str("%struct._IO_FILE = type { i32, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i32, i32, i32, i16, i8, [1 x i8], i8*, i64, i8*, i8*, i8*, i8*, i32, i32, i32, i32, i16, i8, [1 x i8], i8*, i64, i32, i32, i32, i32, i32, i32, i32, i32, i8*, i64, i8*, i64, i32, i32, i32, i32 }\n");
     ir.push_str("@stdin = external global %struct._IO_FILE*\n\n");
+
+    for class in &mut program.classes {
+        let has_constructor = class.methods.iter().any(|m| m.is_constructor);
+        if !has_constructor {
+            let empty_constructor = Function {
+                name: class.name.clone(),
+                params: Vec::new(),
+                return_type: Type::Class(class.name.clone()),
+                body: Vec::new(),
+                is_public: true,
+                is_static: false,
+                is_constructor: true,
+            };
+            class.methods.insert(0, empty_constructor);
+        }
+    }
 
     for class in &program.classes {
         let mut fields = Vec::new();
@@ -340,6 +357,7 @@ fn get_struct_size(class_name: &str, program: &Program) -> usize {
         let (size, align) = match field.type_ {
             Type::Int => (16, 16),
             Type::String => (8, 8),
+            Type::Bool => (1, 1),
             Type::Class(_) => (8, 8),
             Type::Void => (0, 8),
         };
@@ -378,8 +396,39 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
         Expression::StringLit(s) => {
             let label = format!(".str{}", *string_counter);
             *string_counter += 1;
-            let escaped = s.replace("\\", "\\\\").replace("\"", "\\\"");
-            let len = escaped.len() + 1;
+
+            let mut escaped = String::new();
+            let mut char_count = 0;
+            for ch in s.chars() {
+                match ch {
+                    '\n' => {
+                        escaped.push_str("\\0A");
+                        char_count += 1;
+                    }
+                    '\t' => {
+                        escaped.push_str("\\09");
+                        char_count += 1;
+                    }
+                    '\r' => {
+                        escaped.push_str("\\0D");
+                        char_count += 1;
+                    }
+                    '"' => {
+                        escaped.push_str("\\\"");
+                        char_count += 1;
+                    }
+                    '\\' => {
+                        escaped.push_str("\\\\");
+                        char_count += 1;
+                    }
+                    _ => {
+                        escaped.push(ch);
+                        char_count += ch.len_utf8();
+                    }
+                }
+            }
+
+            let len = char_count + 1;
             strings.push_str(&format!("@{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1\n", label, len, escaped));
             let ptr = format!("getelementptr inbounds ([{} x i8], [{} x i8]* @{}, i32 0, i32 0)", len, len, label);
             (String::new(), ptr, "i8*".to_string())
@@ -808,6 +857,123 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 }
             }
         }
+        Expression::Rand { max } => {
+            let seed_ptr = "@rand_seed";
+            let llvm_seed_type = "i128";
+
+            if !strings.contains(seed_ptr) {
+                strings.push_str(&format!("{} = global {} 0\n", seed_ptr, llvm_seed_type));
+            }
+
+            let init_label = format!(".rand_init{}", *temp_counter);
+            let after_init = format!(".rand_after{}", *temp_counter);
+            *temp_counter += 1;
+
+            let seed_load = format!("%seed_load{}", *temp_counter);
+            *temp_counter += 1;
+            let is_init = format!("%is_init{}", *temp_counter);
+            *temp_counter += 1;
+            let tsc = format!("%tsc{}", *temp_counter);
+            *temp_counter += 1;
+
+            let mut ir = String::new();
+
+            ir.push_str(&format!("  {} = load {}, {}* {}\n", seed_load, llvm_seed_type, llvm_seed_type, seed_ptr));
+            ir.push_str(&format!("  {} = icmp eq i128 {}, 0\n", is_init, seed_load));
+            ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n", is_init, init_label, after_init));
+
+            ir.push_str(&format!("{}:\n", init_label));
+            ir.push_str("  %tsc_tmp = call i64 @llvm.readcyclecounter()\n");
+            ir.push_str(&format!("  {} = zext i64 %tsc_tmp to i128\n", tsc));
+            ir.push_str(&format!("  store i128 {}, i128* {}\n", tsc, seed_ptr));
+            ir.push_str(&format!("  br label %{}\n", after_init));
+
+            ir.push_str(&format!("{}:\n", after_init));
+
+            let seed_val = format!("%seed_val{}", *temp_counter);
+            *temp_counter += 1;
+            let mul_result = format!("%mul{}", *temp_counter);
+            *temp_counter += 1;
+            let add_result = format!("%add{}", *temp_counter);
+            *temp_counter += 1;
+            let rand_val = format!("%rand_val{}", *temp_counter);
+            *temp_counter += 1;
+
+            ir.push_str(&format!("  {} = load {}, {}* {}\n", seed_val, llvm_seed_type, llvm_seed_type, seed_ptr));
+            ir.push_str(&format!("  {} = mul i128 {}, 1103515245\n", mul_result, seed_val));
+            ir.push_str(&format!("  {} = add i128 {}, 12345\n", add_result, mul_result));
+            ir.push_str(&format!("  store i128 {}, i128* {}\n", add_result, seed_ptr));
+            ir.push_str(&format!("  {} = sdiv i128 {}, 65536\n", rand_val, add_result));
+
+            if let Some(max_expr) = max {
+                let (max_ir, max_reg, _) = generate_expression(program, max_expr, temp_counter, string_counter, strings, var_types, current_class);
+                ir.push_str(&max_ir);
+                let srem_result = format!("%srem{}", *temp_counter);
+                *temp_counter += 1;
+                let final_result = format!("%t{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = srem i128 {}, {}\n", srem_result, rand_val, max_reg));
+                ir.push_str(&format!("  {} = add i128 {}, 1\n", final_result, srem_result));
+                (ir, final_result, "i128".to_string())
+            } else {
+                (ir, rand_val, "i128".to_string())
+            }
+        }
+        Expression::CguiCall { func, args } => {
+            let mut ir = String::new();
+            let mut arg_regs = Vec::new();
+            let mut arg_types = Vec::new();
+
+            for arg in args {
+                let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
+                ir.push_str(&arg_ir);
+                arg_regs.push(arg_reg);
+                arg_types.push(arg_type);
+            }
+
+            let args_str: Vec<String> = arg_regs.iter().zip(arg_types.iter()).map(|(r, t)| format!("{} {}", t, r)).collect();
+
+            let ret_type = if func == "create_window" || func == "window_should_close" {
+                "i128"
+            } else {
+                "void"
+            };
+
+            let mut declare_args = Vec::new();
+            for arg_type in &arg_types {
+                declare_args.push(match arg_type.as_str() {
+                    "i8*" => "i8*",
+                    "i128" => "i128",
+                    _ => "i32",
+                });
+            }
+            let declare_line = format!("declare {} @{}({})", ret_type, func, declare_args.join(", "));
+            
+            if !strings.contains(&declare_line) {
+                strings.push_str(&format!("declare {} @{}({})\n", ret_type, func, declare_args.join(", ")));
+            }
+
+            if ret_type == "void" {
+                ir.push_str(&format!("  call {} @{}({})\n", ret_type, func, args_str.join(", ")));
+                (ir, String::new(), "void".to_string())
+            } else {
+                let call_reg = format!("%t{}", *temp_counter);
+                *temp_counter += 1;
+                ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, func, args_str.join(", ")));
+                (ir, call_reg, ret_type.to_string())
+            }
+        }
+        Expression::Not(expr) => {
+            let (ir, reg, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+            let result = format!("%t{}", *temp_counter);
+            *temp_counter += 1;
+            let cmp = format!("%cmp{}", *temp_counter);
+            *temp_counter += 1;
+            let mut new_ir = ir;
+            new_ir.push_str(&format!("  {} = icmp eq i128 {}, 0\n", cmp, reg));
+            new_ir.push_str(&format!("  {} = zext i1 {} to i128\n", result, cmp));
+            (new_ir, result, "i128".to_string())
+        }
     }
 }
 
@@ -815,6 +981,7 @@ fn llvm_type(t: &Type) -> String {
     match t {
         Type::Int => "i128".to_string(),
         Type::String => "i8*".to_string(),
+        Type::Bool => "i1".to_string(),
         Type::Void => "void".to_string(),
         Type::Class(name) => format!("%{}*", name),
     }

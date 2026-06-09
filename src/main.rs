@@ -16,14 +16,14 @@ pub struct Token {
 #[derive(Debug, PartialEq, Clone)]
 pub enum TokenKind {
     Fn, Let, Int, If, Class, Return,
-    Public, Private, This, New,
+    Public, Private, This, New, Not,
     Identifier(String), StringType, StringLit(String), Number(i128), Boolean(bool),
     Assign, Plus, Minus, Semicolon,
     LParen, RParen, LBrace, RBrace,
     Star, Slash, Comma, Colon, Arrow, Dot,
-    EOF, Else, ColonColon,
-    EqEq, Neq, Lt, Le, Gt, Ge,
-    Input, While, For, Import,
+    EOF, Else, ColonColon, FnOut, BoolType,
+    EqEq, Neq, Lt, Le, Gt, Ge, Rand,
+    Input, While, For, Import, Cgui,
 }
 
 pub struct Lexer {
@@ -92,6 +92,11 @@ impl Lexer {
             "true" => TokenKind::Boolean(true),
             "false" => TokenKind::Boolean(false),
             "import" => TokenKind::Import,
+            "fnOut" => TokenKind::FnOut,
+            "rand" => TokenKind::Rand,
+            "cgui" => TokenKind::Cgui,
+            "bool" => TokenKind::BoolType,
+            "boolean" => TokenKind::BoolType,
             _ => TokenKind::Identifier(word),
         };
         Token { kind, line }
@@ -142,7 +147,7 @@ impl Lexer {
                     self.pos += 1;
                     Token { kind: TokenKind::Neq, line }
                 } else {
-                    panic!("Ожидался != на строке {}", line);
+                    Token { kind: TokenKind::Not, line }
                 }
             }
             '<' => {
@@ -195,13 +200,30 @@ impl Lexer {
                 self.pos += 1;
                 let start = self.pos;
                 let line = self.line;
+                let mut s = String::new();
                 while self.pos < self.input.len() && self.input[self.pos] != '"' {
+                    if self.input[self.pos] == '\\' {
+                        self.pos += 1;
+                        if self.pos >= self.input.len() {
+                            panic!("Незакрытая escape-последовательность на строке {}", line);
+                        }
+                        match self.input[self.pos] {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            '\\' => s.push('\\'),
+                            '"' => s.push('"'),
+                            _ => panic!("Неизвестная escape-последовательность \\{} на строке {}", self.input[self.pos], line),
+                        }
+                        self.pos += 1;
+                    } else {
+                        s.push(self.input[self.pos]);
+                        self.pos += 1;
+                    }
                     if self.input[self.pos] == '\n' {
                         panic!("Незакрытая строка на строке {}", line);
                     }
-                    self.pos += 1;
                 }
-                let s: String = self.input[start..self.pos].iter().collect();
                 self.pos += 1;
                 Token { kind: TokenKind::StringLit(s), line }
             }
@@ -357,7 +379,6 @@ impl Parser {
             } else {
                 let field_type = self.parse_type();
                 let field_name = self.parse_identifier();
-                println!("[DEBUG] Parsed field: {} {:?}", field_name, field_type);
                 if self.current_token() == TokenKind::Assign {
                     self.advance();
                     let _ = self.parse_expression(true, false, &HashSet::new());
@@ -605,12 +626,6 @@ impl Parser {
                     if param_names.contains(&name) {
                         Expression::Variable(name)
                     }
-                    else if in_class && !in_constructor {
-                        Expression::FieldAccess {
-                            object: Box::new(Expression::This),
-                            field: name,
-                        }
-                    }
                     else {
                         Expression::Variable(name)
                     }
@@ -671,6 +686,48 @@ impl Parser {
                 self.expect(TokenKind::RParen);
                 Expression::Input(input_type)
             }
+            TokenKind::FnOut => {
+                self.advance();
+                self.expect(TokenKind::Dot);
+                let func = self.parse_identifier();
+                self.expect(TokenKind::LParen);
+                let mut args = Vec::new();
+                while self.current_token() != TokenKind::RParen {
+                    args.push(self.parse_expression(in_class, in_constructor, param_names));
+                    if self.current_token() == TokenKind::Comma { self.advance(); }
+                }
+                self.expect(TokenKind::RParen);
+                Expression::Call { func, args }
+            }
+            TokenKind::Rand => {
+                self.advance();
+                self.expect(TokenKind::LParen);
+                let max = if self.current_token() != TokenKind::RParen {
+                    Some(Box::new(self.parse_expression(in_class, in_constructor, param_names)))
+                } else {
+                    None
+                };
+                self.expect(TokenKind::RParen);
+                Expression::Rand { max }
+            }
+            TokenKind::Cgui => {
+                self.advance();
+                self.expect(TokenKind::Dot);
+                let func = self.parse_identifier();
+                self.expect(TokenKind::LParen);
+                let mut args = Vec::new();
+                while self.current_token() != TokenKind::RParen {
+                    args.push(self.parse_expression(in_class, in_constructor, param_names));
+                    if self.current_token() == TokenKind::Comma { self.advance(); }
+                }
+                self.expect(TokenKind::RParen);
+                Expression::CguiCall { func, args }
+            }
+            TokenKind::Not => {
+                self.advance();
+                let expr = self.parse_primary(in_class, in_constructor, param_names);
+                Expression::Not(Box::new(expr))
+            }
             _ => panic!("Ожидалось выражение на строке {}", line),
         }
     }
@@ -720,6 +777,14 @@ impl Parser {
                 let value = self.parse_expression(in_class, in_constructor, param_names);
                 self.expect(TokenKind::Semicolon);
                 Statement::Let { name, type_, value }
+            }
+            TokenKind::Int | TokenKind::StringType if in_class => {
+                let type_ = self.parse_type();
+                let name = self.parse_identifier();
+                self.expect(TokenKind::Assign);
+                let value = self.parse_expression(in_class, in_constructor, param_names);
+                self.expect(TokenKind::Semicolon);
+                Statement::Let { name, type_: Some(type_), value }
             }
             TokenKind::Return => {
                 self.advance();
@@ -812,20 +877,84 @@ impl Parser {
     }
 }
 
-fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<Class>, functions: &mut Vec<Function>) {
+fn load_file(path: &std::path::Path, root_path: &std::path::Path, classes: &mut Vec<Class>, functions: &mut Vec<Function>, processed: &mut HashSet<std::path::PathBuf>) {
+    let canonical = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[ERROR] Failed to canonicalize {:?}: {}", path, e);
+            return;
+        }
+    };
+    if processed.contains(&canonical) {
+        eprintln!("[DEBUG] Already processed: {:?}", canonical);
+        return;
+    }
+    processed.insert(canonical.clone());
+
+    let source = fs::read_to_string(path).expect(&format!("Не удалось прочитать {}", path.display()));
+    let mut lexer = Lexer::new(&source);
+    let mut tokens = Vec::new();
+    loop {
+        let token = lexer.next_token();
+        if token.kind == TokenKind::EOF { break; }
+        tokens.push(token);
+    }
+    let mut parser = Parser::new(tokens);
+    let (program, imports) = parser.parse_program();
+
+    for class in program.classes {
+        if classes.iter().any(|c| c.name == class.name) {
+            panic!("Класс {} уже определён", class.name);
+        }
+        classes.push(class);
+    }
+    for func in program.functions {
+        if functions.iter().any(|f| f.name == func.name) {
+            panic!("Функция {} уже определена", func.name);
+        }
+        functions.push(func);
+    }
+
+    for import in imports {
+        load_import_recursive(&import, root_path, classes, functions, processed);
+    }
+}
+
+fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: &mut Vec<Class>, functions: &mut Vec<Function>, processed: &mut HashSet<std::path::PathBuf>) {
+    if import.path.first() == Some(&"llgui".to_string()) {
+        let last = import.path.last().unwrap();
+        if last == "*" {
+            let lp_dir = get_llgui_lib_path().join("llgui");
+            if let Ok(entries) = fs::read_dir(&lp_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lp") {
+                        load_file(&path, root_path, classes, functions, processed);
+                    }
+                }
+            }
+        } else {
+            let lp_path = get_llgui_lib_path().join(format!("llgui/{}.lp", last));
+            if lp_path.exists() {
+                load_file(&lp_path, root_path, classes, functions, processed);
+            } else {
+                panic!("LLGUI class '{}' not found in builtin library", last);
+            }
+        }
+        return;
+    }
+
     if import.path.is_empty() {
         return;
     }
 
     let last = import.path.last().unwrap();
     let is_star = last == "*";
-    let folder_path = if is_star {
-        &import.path[0..import.path.len()-1]
-    } else {
-        &import.path[..]
-    };
 
-    let mut dir_path = base_path.to_path_buf();
+    let folder_path = &import.path[0..import.path.len()-1];
+    let file_name = if !is_star { Some(last.as_str()) } else { None };
+
+    let mut dir_path = root_path.to_path_buf();
     for segment in folder_path {
         dir_path.push(segment);
     }
@@ -844,40 +973,22 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         }
     }
 
-    if !is_star {
-        let target_name = format!("{}.lp", last);
+    if let Some(name) = file_name {
+        let target_name = format!("{}.lp", name);
         lp_files.retain(|p| p.file_name().and_then(|n| n.to_str()) == Some(&target_name));
         if lp_files.is_empty() {
-            panic!("Файл {}.lp не найден в {}", last, dir_path.display());
+            panic!("Файл {}.lp не найден в {}", name, dir_path.display());
         }
     }
 
     for file_path in lp_files {
-        let source = fs::read_to_string(&file_path).expect(&format!("Не удалось прочитать {}", file_path.display()));
-        let mut lexer = Lexer::new(&source);
-        let mut tokens = Vec::new();
-        loop {
-            let token = lexer.next_token();
-            if token.kind == TokenKind::EOF { break; }
-            tokens.push(token);
-        }
-        let mut parser = Parser::new(tokens);
-        let (imported_program, _) = parser.parse_program(); // рекурсивные импорты пока игнорируем
-
-        for class in imported_program.classes {
-            if classes.iter().any(|c| c.name == class.name) {
-                panic!("Класс {} уже определён", class.name);
-            }
-            classes.push(class);
-        }
-
-        for func in imported_program.functions {
-            if functions.iter().any(|f| f.name == func.name) {
-                panic!("Функция {} уже определена", func.name);
-            }
-            functions.push(func);
-        }
+        load_file(&file_path, root_path, classes, functions, processed);
     }
+}
+
+fn get_llgui_lib_path() -> std::path::PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    std::path::Path::new(&manifest_dir).join("libs/llgui_lib")
 }
 
 fn main() {
@@ -889,8 +1000,6 @@ fn main() {
 
     let filename = &args[1];
     let should_run = args.contains(&"--run".to_string());
-
-    let base_path = std::path::Path::new(filename).parent().unwrap_or(std::path::Path::new("."));
 
     let source = fs::read_to_string(filename).expect("Не удалось прочитать файл");
     let mut lexer = Lexer::new(&source);
@@ -904,31 +1013,61 @@ fn main() {
     let mut parser = Parser::new(tokens);
     let (program, imports) = parser.parse_program();
 
+    let root_path = std::path::Path::new(filename).parent().unwrap().canonicalize().unwrap();
+    let main_abs_path = std::fs::canonicalize(filename).unwrap();
+
+    let mut processed = HashSet::new();
+    processed.insert(main_abs_path);
+
     let mut all_classes = program.classes;
     let mut all_functions = program.functions;
+    let mut has_llgui = false;
 
     for import in imports {
-        load_import(&import, base_path, &mut all_classes, &mut all_functions);
+        if import.path.first() == Some(&"llgui".to_string()) {
+            has_llgui = true;
+        }
+        load_import_recursive(&import, &root_path, &mut all_classes, &mut all_functions, &mut processed);
     }
 
-    let final_program = Program {
+    let mut final_program = Program {
         classes: all_classes,
         functions: all_functions,
     };
 
-    println!("\n========== AST ==========");
-    println!("{}", final_program);
-    println!("========================\n");
-
-    let ir = codegen::generate(&final_program);
+    let ir = codegen::generate(&mut final_program);
     fs::write("out.ll", &ir).expect("Не удалось записать IR");
     let status = Command::new("llc").arg("out.ll").arg("-o").arg("out.s").status().expect("llc не найден");
     if !status.success() { eprintln!("Ошибка компиляции IR в ассемблер"); std::process::exit(1); }
-    let status = Command::new("clang").args(&["out.s", "-o", "out", "-no-pie"]).status().expect("clang не найден");
+
+    let out_name = if has_llgui { "gui" } else { "out" };
+
+    let mut link_cmd = Command::new("clang");
+    link_cmd.args(&["out.s", "-o", out_name, "-no-pie"]);
+
+    if has_llgui {
+        let window_o_path = get_llgui_lib_path().join("window.o");
+        if window_o_path.exists() {
+            link_cmd.arg(&window_o_path);
+        } else {
+            eprintln!("Предупреждение: window.o не найден в {}", window_o_path.display());
+        }
+        link_cmd.arg("-lX11");
+    }
+
+    let status = link_cmd.status().expect("clang не найден");
     if !status.success() { eprintln!("Ошибка линковки бинарника"); std::process::exit(1); }
+
     if should_run {
-        let output = Command::new("./out").output().expect("Ошибка запуска программы");
+        let output = Command::new(format!("./{}", out_name)).output().expect("Ошибка запуска программы");
         print!("{}", String::from_utf8_lossy(&output.stdout));
         if !output.stderr.is_empty() { eprint!("{}", String::from_utf8_lossy(&output.stderr)); }
-    } else { println!("✅ Скомпилировано в ./out\n   Запустите: ./out"); }
+    } else {
+        println!("✅ Скомпилировано в ./{}", out_name);
+        if has_llgui {
+            println!("   Запустите: ./gui");
+        } else {
+            println!("   Запустите: ./out");
+        }
+    }
 }

@@ -3,3 +3,5 @@
 /out.ll
 /out.s
 /srcll
+/*.o
+/gui
