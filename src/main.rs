@@ -34,7 +34,7 @@ pub struct Lexer {
 
 #[derive(Debug, Clone)]
 struct Import {
-    path: Vec<String>,   // например ["llgui", "*"] или ["llgui", "Window"]
+    path: Vec<String>,
     line: usize,
 }
 
@@ -306,7 +306,6 @@ impl Parser {
 
         let mut path = Vec::new();
 
-        // первая часть пути
         match self.current_token() {
             TokenKind::Identifier(name) => {
                 path.push(name);
@@ -315,9 +314,8 @@ impl Parser {
             _ => panic!("Ожидался идентификатор в импорте на строке {}", line),
         }
 
-        // :: разделители
         while self.current_token() == TokenKind::ColonColon {
-            self.advance(); // пропустить ::
+            self.advance();
 
             match self.current_token() {
                 TokenKind::Identifier(name) => {
@@ -410,13 +408,13 @@ impl Parser {
 
         self.expect(TokenKind::LParen);
         let mut params = Vec::new();
-        let mut param_names = HashSet::new();  // ← ЭТО УЖЕ ЕСТЬ, НО ДАЛЬШЕ НЕ ИСПОЛЬЗУЕТСЯ
+        let mut param_names = HashSet::new();
 
         if self.current_token() != TokenKind::RParen {
             loop {
                 let param_type = self.parse_type();
                 let param_name = self.parse_identifier();
-                param_names.insert(param_name.clone());  // ← ДОБАВЛЯЕМ ПАРАМЕТР
+                param_names.insert(param_name.clone());
                 params.push((param_name, param_type));
                 match self.current_token() {
                     TokenKind::Comma => { self.advance(); continue; }
@@ -430,7 +428,6 @@ impl Parser {
 
         let mut body = Vec::new();
         while self.current_token() != TokenKind::RBrace {
-            // ↓ ПЕРЕДАЁМ param_names В parse_statement
             body.push(self.parse_statement(true, is_constructor, &param_names));
         }
         self.expect(TokenKind::RBrace);
@@ -453,7 +450,6 @@ impl Parser {
         let mut params = Vec::new();
         if self.current_token() != TokenKind::RParen {
             loop {
-                // Rust-стиль: имя: тип
                 let param_name = self.parse_identifier();
                 self.expect(TokenKind::Colon);
                 let param_type = self.parse_type();
@@ -566,7 +562,6 @@ impl Parser {
             TokenKind::Identifier(name) => {
                 self.advance();
 
-                // Вызов метода
                 if self.current_token() == TokenKind::LParen {
                     self.advance();
                     let mut args = Vec::new();
@@ -576,7 +571,6 @@ impl Parser {
                     }
                     self.expect(TokenKind::RParen);
 
-                    // Если мы внутри класса и это не параметр - это метод текущего класса
                     if in_class && !param_names.contains(&name) && !in_constructor {
                         Expression::MethodCall {
                             object: Box::new(Expression::This),
@@ -587,7 +581,6 @@ impl Parser {
                         Expression::Call { func: name, args }
                     }
                 }
-                // Доступ к полю через точку
                 else if self.current_token() == TokenKind::Dot {
                     self.advance();
                     let member = self.parse_identifier();
@@ -609,20 +602,16 @@ impl Parser {
                     }
                 }
                 else {
-                    // Переменная, параметр или поле класса
                     if param_names.contains(&name) {
-                        // Это параметр функции
                         Expression::Variable(name)
                     }
                     else if in_class && !in_constructor {
-                        // Это поле текущего класса (без this)
                         Expression::FieldAccess {
                             object: Box::new(Expression::This),
                             field: name,
                         }
                     }
                     else {
-                        // Обычная локальная переменная
                         Expression::Variable(name)
                     }
                 }
@@ -836,7 +825,6 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         &import.path[..]
     };
 
-    // Строим путь к папке
     let mut dir_path = base_path.to_path_buf();
     for segment in folder_path {
         dir_path.push(segment);
@@ -846,7 +834,6 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         panic!("Папка не найдена: {}", dir_path.display());
     }
 
-    // Собираем все .lp файлы
     let mut lp_files = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir_path) {
         for entry in entries.flatten() {
@@ -857,7 +844,6 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         }
     }
 
-    // Если нужно конкретное имя (не *), фильтруем
     if !is_star {
         let target_name = format!("{}.lp", last);
         lp_files.retain(|p| p.file_name().and_then(|n| n.to_str()) == Some(&target_name));
@@ -866,7 +852,6 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         }
     }
 
-    // Загружаем и парсим каждый файл
     for file_path in lp_files {
         let source = fs::read_to_string(&file_path).expect(&format!("Не удалось прочитать {}", file_path.display()));
         let mut lexer = Lexer::new(&source);
@@ -880,7 +865,6 @@ fn load_import(import: &Import, base_path: &std::path::Path, classes: &mut Vec<C
         let (imported_program, _) = parser.parse_program(); // рекурсивные импорты пока игнорируем
 
         for class in imported_program.classes {
-            // Проверка на дубликаты
             if classes.iter().any(|c| c.name == class.name) {
                 panic!("Класс {} уже определён", class.name);
             }
@@ -906,7 +890,6 @@ fn main() {
     let filename = &args[1];
     let should_run = args.contains(&"--run".to_string());
 
-    // Получаем директорию основного файла
     let base_path = std::path::Path::new(filename).parent().unwrap_or(std::path::Path::new("."));
 
     let source = fs::read_to_string(filename).expect("Не удалось прочитать файл");
@@ -921,7 +904,6 @@ fn main() {
     let mut parser = Parser::new(tokens);
     let (program, imports) = parser.parse_program();
 
-    // Загружаем импортированные файлы
     let mut all_classes = program.classes;
     let mut all_functions = program.functions;
 
