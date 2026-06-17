@@ -1069,6 +1069,29 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
     }
 }
 
+pub fn check_tool_in_system(name: &str) -> bool {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn ensure_tools() {
+    let tools = ["clang", "llc", "lld"];
+
+    for tool in tools {
+        if !check_tool_in_system(tool) {
+            println!("⚠️ {} не найден.", tool);
+            println!("   Установите LLVM через пакетный менеджер:");
+            println!("   Arch:    sudo pacman -S clang llvm");
+            println!("   Ubuntu:  sudo apt install clang llvm");
+            println!("   Windows: https://releases.llvm.org/");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -1094,6 +1117,7 @@ fn main() {
 
     cache::ensure_dirs();
     libs::ensure_libs();
+    ensure_tools();
 
     let source = fs::read_to_string(filename).expect("Не удалось прочитать файл");
     let mut lexer = Lexer::new(&source);

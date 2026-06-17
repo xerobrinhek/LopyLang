@@ -2,8 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::env;
 use reqwest;
-use flate2::read::GzDecoder;
-use tar::Archive;
 
 const LIBS_REPO: &str = "xerobrinhek/lopy-libs";
 const VERSION_FILE: &str = "version.txt";

@@ -809,6 +809,7 @@ dependencies = [
  "serde_json",
  "tar",
  "unicode-xid",
+ "xz2",
  "zip",
 ]
 
