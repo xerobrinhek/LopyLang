@@ -99,8 +99,14 @@ pub enum Expression {
     This,
     Assignment { left: Box<Expression>, right: Box<Expression> },
     Rand { max: Option<Box<Expression>> },
-    CguiCall { func: String, args: Vec<Expression> },
+    CrCall { func: String, args: Vec<Expression> },
     Not(Box<Expression>),
+    Thread {
+        obj: Box<Expression>,
+        code: String,
+    },
+    PostInc(Box<Expression>),
+    PostDec(Box<Expression>),
 }
 
 #[derive(Debug)]

@@ -1,5 +1,6 @@
 use crate::ast::*;
 use std::collections::HashMap;
+use crate::{Lexer, Parser, TokenKind};
 
 pub fn generate(program: &mut Program) -> String {
     let mut ir = String::new();
@@ -20,6 +21,7 @@ pub fn generate(program: &mut Program) -> String {
     ir.push_str("declare i32 @sprintf(i8*, i8*, ...)\n");
     ir.push_str("declare i8* @fgets(i8*, i32, i8*)\n\n");
     ir.push_str("declare i64 @llvm.readcyclecounter()\n");
+    ir.push_str("declare void @pthread_exit(ptr)\n");
 
     ir.push_str("@.str.true_val = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n");
     ir.push_str("@.str.false_val = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n");
@@ -53,7 +55,7 @@ pub fn generate(program: &mut Program) -> String {
         for field in &class.fields {
             fields.push(llvm_type(&field.type_));
         }
-        ir.push_str(&format!("%{} = type {{ {}}}\n\n", class.name, fields.join(", ")));
+        ir.push_str(&format!("%{} = type {{ {}}}\n\n", mangle_name(&class.name), fields.join(", ")));
     }
 
     for class in &program.classes {
@@ -104,13 +106,15 @@ fn generate_method(program: &Program, class: &Class, method: &Function, string_c
     let mut ir = String::new();
     let mut var_types: HashMap<String, (String, String)> = HashMap::new();
 
-    let llvm_name = format!("{}_{}", class.name, method.name);
+    let mangled_class = mangle_name(&class.name);
+    let mangled_method = mangle_name(&method.name);
+    let llvm_name = format!("{}_{}", mangled_class, mangled_method);
     let ret_type = if method.is_constructor {
-        format!("%{}*", class.name)
+        format!("%{}*", mangled_class)
     } else {
         llvm_type(&method.return_type)
     };
-    let this_type = format!("%{}*", class.name);
+    let this_type = format!("%{}*", mangled_class);
 
     ir.push_str(&format!("define {} @{}({}", ret_type, llvm_name, this_type));
     for (_, param_type) in &method.params {
@@ -163,7 +167,7 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
     let mut var_types: HashMap<String, (String, String)> = HashMap::new();
 
     let ret_type = llvm_type(&func.return_type);
-    ir.push_str(&format!("define {} @{}(", ret_type, func.name));
+    ir.push_str(&format!("define {} @{}(", ret_type, mangle_name(&func.name)));
     for (i, (_, t)) in func.params.iter().enumerate() {
         if i > 0 { ir.push_str(", "); }
         ir.push_str(&llvm_type(t));
@@ -173,7 +177,7 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
     let mut param_counter = 0;
     for (name, t) in &func.params {
         let llvm_t = llvm_type(t);
-        let param_alloca = format!("%{}_{}", name, *string_counter);
+        let param_alloca = format!("%{}_{}", mangle_name(name), *string_counter);
         *string_counter += 1;
         ir.push_str(&format!("  {} = alloca {}\n", param_alloca, llvm_t));
         ir.push_str(&format!("  store {} %{}, {}* {}\n", llvm_t, param_counter, llvm_t, param_alloca));
@@ -187,7 +191,12 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
     }
 
     if func.return_type == Type::Void {
-        ir.push_str("  ret void\n");
+        if func.name == "main" {
+            ir.push_str("  call void @pthread_exit(ptr null)\n");
+            ir.push_str("  unreachable\n");
+        } else {
+            ir.push_str("  ret void\n");
+        }
     }
     ir.push_str("}\n\n");
     ir
@@ -201,7 +210,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
                 Some(t) => llvm_type(t),
                 None => val_type.clone(),
             };
-            let var_alloca = format!("%{}_{}", name, *string_counter);
+            let var_alloca = format!("%{}_{}", mangle_name(name), *string_counter);
             *string_counter += 1;
             let alloca = format!("  {} = alloca {}\n", var_alloca, llvm_t);
             let store = format!("  store {} {}, {}* {}\n", val_type, val_reg, llvm_t, var_alloca);
@@ -601,18 +610,18 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             if let Some(f) = program.functions.iter().find(|f| f.name == *func) {
                 let ret_type = llvm_type(&f.return_type);
                 if f.return_type == Type::Void {
-                    ir.push_str(&format!("  call {} @{}({})\n", ret_type, func, args_str.join(", ")));
+                    ir.push_str(&format!("  call {} @{}({})\n", ret_type, mangle_name(func), args_str.join(", ")));
                     (ir, String::new(), ret_type)
                 } else {
                     let call_reg = format!("%t{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, func, args_str.join(", ")));
+                    ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, mangle_name(func), args_str.join(", ")));
                     (ir, call_reg, ret_type)
                 }
             } else {
                 let call_reg = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
-                ir.push_str(&format!("  {} = call i128 @{}({})\n", call_reg, func, args_str.join(", ")));
+                ir.push_str(&format!("  {} = call i128 @{}({})\n", call_reg, mangle_name(func), args_str.join(", ")));
                 (ir, call_reg, "i128".to_string())
             }
         }
@@ -630,7 +639,9 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             }
 
             let class_name = obj_type.trim_start_matches('%').trim_end_matches('*');
-            let llvm_method = format!("{}_{}", class_name, method);
+            let mangled_class = mangle_name(class_name);
+            let mangled_method = mangle_name(method);
+            let llvm_method = format!("{}_{}", mangled_class, mangled_method);
             let args_str: Vec<String> = arg_regs.iter().zip(arg_types.iter()).map(|(r, t)| format!("{} {}", t, r)).collect();
 
             let method_def = program.classes.iter()
@@ -651,44 +662,47 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
         }
         Expression::New { class, args } => {
             let mut ir = String::new();
+            let mangled_class = mangle_name(class);
             let struct_size = get_struct_size(class, program);
 
-            let size_reg = format!("%{}_size_{}", class, *temp_counter);
+            let size_reg = format!("%{}_size_{}", mangled_class, *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!("  {} = mul i64 {}, 1\n", size_reg, struct_size));
 
-            let ptr_reg = format!("%{}_ptr_{}", class, *temp_counter);
+            let ptr_reg = format!("%{}_ptr_{}", mangled_class, *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr_reg, size_reg));
 
-            let obj_ptr = format!("%{}_obj_{}", class, *temp_counter);
+            let obj_ptr = format!("%{}_obj_{}", mangled_class, *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = bitcast i8* {} to %{}*\n", obj_ptr, ptr_reg, class));
+            ir.push_str(&format!("  {} = bitcast i8* {} to %{}*\n", obj_ptr, ptr_reg, mangled_class));
 
-            let constructor_name = format!("{}_{}", class, class);
-            let init_reg = format!("%{}_init_{}", class, *temp_counter);
+            let constructor_name = format!("{}_{}", mangled_class, mangled_class);
+            let init_reg = format!("%{}_init_{}", mangled_class, *temp_counter);
             *temp_counter += 1;
 
-            let mut constructor_args = vec![format!("%{}* {}", class, obj_ptr)];
+            let mut constructor_args = vec![format!("%{}* {}", mangled_class, obj_ptr)];
             for arg in args {
                 let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&arg_ir);
                 constructor_args.push(format!("{} {}", arg_type, arg_reg));
             }
 
-            ir.push_str(&format!("  {} = call %{}* @{}({})\n", init_reg, class, constructor_name, constructor_args.join(", ")));
-            (ir, init_reg, format!("%{}*", class))
+            ir.push_str(&format!("  {} = call %{}* @{}({})\n", init_reg, mangled_class, constructor_name, constructor_args.join(", ")));
+            (ir, init_reg, format!("%{}*", mangled_class))
         }
         Expression::FieldAccess { object, field } => {
             let (obj_ir, obj_reg, obj_type) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = obj_ir;
             let class_name = obj_type.trim_start_matches('%').trim_end_matches('*');
+            let mangled_class = mangle_name(class_name);
+            let mangled_field = mangle_name(field);
             let class_def = program.classes.iter().find(|c| c.name == class_name).unwrap();
             let index = class_def.fields.iter().position(|f| f.name == *field).unwrap();
             let field_type = llvm_type(&class_def.fields[index].type_);
-            let field_ptr = format!("%field_ptr_{}_{}_{}", class_name, field, *temp_counter);
+            let field_ptr = format!("%field_ptr_{}_{}_{}", mangled_class, mangled_field, *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = getelementptr %{}, %{}* {}, i32 0, i32 {}\n", field_ptr, class_name, class_name, obj_reg, index));
+            ir.push_str(&format!("  {} = getelementptr %{}, %{}* {}, i32 0, i32 {}\n", field_ptr, mangled_class, mangled_class, obj_reg, index));
             let val_reg = format!("%t{}", *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!("  {} = load {}, {}* {}\n", val_reg, field_type, field_type, field_ptr));
@@ -707,12 +721,14 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let (obj_ir, obj_reg, obj_type) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
                     ir.push_str(&obj_ir);
                     let class_name = obj_type.trim_start_matches('%').trim_end_matches('*');
+                    let mangled_class = mangle_name(class_name);
+                    let mangled_field = mangle_name(field);
                     let class_def = program.classes.iter().find(|c| c.name == class_name).unwrap();
                     let index = class_def.fields.iter().position(|f| f.name == *field).unwrap();
                     let field_type = llvm_type(&class_def.fields[index].type_);
-                    let field_ptr = format!("%field_ptr_{}_{}_{}", class_name, field, *temp_counter);
+                    let field_ptr = format!("%field_ptr_{}_{}_{}", mangled_class, mangled_field, *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = getelementptr %{}, %{}* {}, i32 0, i32 {}\n", field_ptr, class_name, class_name, obj_reg, index));
+                    ir.push_str(&format!("  {} = getelementptr %{}, %{}* {}, i32 0, i32 {}\n", field_ptr, mangled_class, mangled_class, obj_reg, index));
                     ir.push_str(&format!("  store {} {}, {}* {}\n", right_type, right_reg, field_type, field_ptr));
                     (ir, right_reg, right_type)
                 }
@@ -919,7 +935,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 (ir, rand_val, "i128".to_string())
             }
         }
-        Expression::CguiCall { func, args } => {
+        Expression::CrCall { func, args } => {
             let mut ir = String::new();
             let mut arg_regs = Vec::new();
             let mut arg_types = Vec::new();
@@ -948,7 +964,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 });
             }
             let declare_line = format!("declare {} @{}({})", ret_type, func, declare_args.join(", "));
-            
+
             if !strings.contains(&declare_line) {
                 strings.push_str(&format!("declare {} @{}({})\n", ret_type, func, declare_args.join(", ")));
             }
@@ -974,7 +990,117 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             new_ir.push_str(&format!("  {} = zext i1 {} to i128\n", result, cmp));
             (new_ir, result, "i128".to_string())
         }
+        Expression::Thread { obj, code } => {
+            let (obj_ir, obj_reg, obj_type) = generate_expression(program, obj, temp_counter, string_counter, strings, var_types, current_class);
+            let mut ir = obj_ir;
+
+            let thread_id = *string_counter;
+            *string_counter += 1;
+            let func_name = format!("__thread_{}", thread_id);
+            let wrapper_name = format!("__thread_wrapper_{}", thread_id);
+
+            let thread_ir = generate_thread_function(&code, &func_name, &wrapper_name, string_counter, strings);
+            ir.push_str(&thread_ir);
+
+            let thread_handle = format!("%thread_{}", thread_id);
+            *temp_counter += 1;
+            ir.push_str(&format!("  {} = call i64 @thread_create(i8* {}, i8* (i8*)* {})\n",
+                                 thread_handle, obj_reg, wrapper_name));
+
+            (ir, thread_handle, "i64".to_string())
+        }
+        Expression::PostInc(expr) => {
+            let (mut ir, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+
+            let var_name = match expr.as_ref() {
+                Expression::Variable(name) => name,
+                _ => panic!("PostInc only for variables"),
+            };
+            let (var_ptr, _) = var_types.get(var_name).cloned().unwrap();
+
+            let old_val = format!("%old_{}", *temp_counter);
+            *temp_counter += 1;
+            let new_val = format!("%new_{}", *temp_counter);
+            *temp_counter += 1;
+
+            ir.push_str(&format!("  {} = load i128, i128* {}\n", old_val, var_ptr));
+            ir.push_str(&format!("  {} = add i128 {}, 1\n", new_val, old_val));
+            ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
+
+            (ir, old_val, "i128".to_string())
+        }
+        Expression::PostDec(expr) => {
+            let (mut ir, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+
+            let var_name = match expr.as_ref() {
+                Expression::Variable(name) => name,
+                _ => panic!("PostDec only for variables"),
+            };
+            let (var_ptr, _) = var_types.get(var_name).cloned().unwrap();
+
+            let old_val = format!("%old_{}", *temp_counter);
+            *temp_counter += 1;
+            let new_val = format!("%new_{}", *temp_counter);
+            *temp_counter += 1;
+
+            ir.push_str(&format!("  {} = load i128, i128* {}\n", old_val, var_ptr));
+            ir.push_str(&format!("  {} = sub i128 {}, 1\n", new_val, old_val));
+            ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
+
+            (ir, old_val, "i128".to_string())
+        }
     }
+}
+
+fn generate_thread_function(code: &str, func_name: &str, wrapper_name: &str, string_counter: &mut usize, strings: &mut String) -> String {
+    let mut ir = String::new();
+
+    let mut lexer = Lexer::new(code);
+    let mut tokens = Vec::new();
+    loop {
+        let token = lexer.next_token();
+        if token.kind == TokenKind::EOF { break; }
+        tokens.push(token);
+    }
+    let mut parser = Parser::new(tokens);
+    let (program, _) = parser.parse_program();
+
+    if let Some(func) = program.functions.first() {
+        let mut var_types = HashMap::new();
+        let mut temp_counter = 0;
+
+        ir.push_str(&format!("define void @{}(i8* %ctx) {{\n", func_name));
+        ir.push_str("  %this = bitcast i8* %ctx to %Window*\n");
+
+        var_types.insert("this".to_string(), ("%this".to_string(), "%Window*".to_string()));
+
+        for stmt in &func.body {
+            ir.push_str(&generate_statement(&program, stmt, &mut temp_counter, &mut var_types, string_counter, strings, None));
+        }
+
+        ir.push_str("  ret void\n");
+        ir.push_str("}\n\n");
+
+        ir.push_str(&format!("define i8* @{}(i8* %arg) {{\n", wrapper_name));
+        ir.push_str(&format!("  call void @{}(i8* %arg)\n", func_name));
+        ir.push_str("  ret i8* null\n");
+        ir.push_str("}\n\n");
+    }
+
+    ir
+}
+
+fn mangle_name(name: &str) -> String {
+    let mut escaped = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            escaped.push(ch);
+        } else {
+            let code = ch as u32;
+            escaped.push_str(&format!("_u{:04x}", code));
+        }
+    }
+    escaped
 }
 
 fn llvm_type(t: &Type) -> String {
@@ -983,6 +1109,6 @@ fn llvm_type(t: &Type) -> String {
         Type::String => "i8*".to_string(),
         Type::Bool => "i1".to_string(),
         Type::Void => "void".to_string(),
-        Type::Class(name) => format!("%{}*", name),
+        Type::Class(name) => format!("%{}*", mangle_name(name)),
     }
 }

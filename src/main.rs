@@ -1,11 +1,15 @@
 mod ast;
 mod codegen;
+mod cache;
+mod libs;
 
 use crate::ast::*;
 use std::env;
 use std::fs;
 use std::process::Command;
 use std::collections::HashSet;
+use std::path::Path;
+use unicode_xid::UnicodeXID;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Token {
@@ -23,7 +27,8 @@ pub enum TokenKind {
     Star, Slash, Comma, Colon, Arrow, Dot,
     EOF, Else, ColonColon, FnOut, BoolType,
     EqEq, Neq, Lt, Le, Gt, Ge, Rand,
-    Input, While, For, Import, Cgui,
+    Input, While, For, Import, Cr, Increment,
+    Decrement,
 }
 
 pub struct Lexer {
@@ -59,17 +64,18 @@ impl Lexer {
     fn read_identifier(&mut self) -> Token {
         let start = self.pos;
         let line = self.line;
+
         while self.pos < self.input.len() &&
-            (self.input[self.pos].is_alphanumeric() || self.input[self.pos] == '_') {
+            (UnicodeXID::is_xid_start(self.input[self.pos]) || self.input[self.pos] == '_')
+        {
+            self.pos += 1;
+        }
+        while self.pos < self.input.len() &&
+            (UnicodeXID::is_xid_continue(self.input[self.pos]) || self.input[self.pos] == '_')
+        {
             self.pos += 1;
         }
         let word: String = self.input[start..self.pos].iter().collect();
-
-        for ch in word.chars() {
-            if ch >= 'а' && ch <= 'я' || ch >= 'А' && ch <= 'Я' || ch == 'ё' || ch == 'Ё' {
-                panic!("Ошибка: использование кириллицы в имени '{}' на строке {}", word, line);
-            }
-        }
 
         let kind = match word.as_str() {
             "fn" => TokenKind::Fn,
@@ -94,9 +100,19 @@ impl Lexer {
             "import" => TokenKind::Import,
             "fnOut" => TokenKind::FnOut,
             "rand" => TokenKind::Rand,
-            "cgui" => TokenKind::Cgui,
+            "cr" => TokenKind::Cr,
             "bool" => TokenKind::BoolType,
             "boolean" => TokenKind::BoolType,
+            "функция" => TokenKind::Fn,
+            "вывод" => TokenKind::Identifier("println".to_string()),
+            "главная" => TokenKind::Identifier("main".to_string()),
+            "если" => TokenKind::If,
+            "иначе" => TokenKind::Else,
+            "пока" => TokenKind::While,
+            "для" => TokenKind::For,
+            "класс" => TokenKind::Class,
+            "новый" => TokenKind::New,
+            "возврат" => TokenKind::Return,
             _ => TokenKind::Identifier(word),
         };
         Token { kind, line }
@@ -168,10 +184,21 @@ impl Lexer {
                     Token { kind: TokenKind::Gt, line }
                 }
             }
-            '+' => { self.pos += 1; Token { kind: TokenKind::Plus, line } }
+            '+' => {
+                self.pos += 1;
+                if self.pos < self.input.len() && self.input[self.pos] == '+' {
+                    self.pos += 1;
+                    Token { kind: TokenKind::Increment, line }
+                } else {
+                    Token { kind: TokenKind::Plus, line }
+                }
+            }
             '-' => {
                 self.pos += 1;
-                if self.pos < self.input.len() && self.input[self.pos] == '>' {
+                if self.pos < self.input.len() && self.input[self.pos] == '-' {
+                    self.pos += 1;
+                    Token { kind: TokenKind::Decrement, line }
+                } else if self.pos < self.input.len() && self.input[self.pos] == '>' {
                     self.pos += 1;
                     Token { kind: TokenKind::Arrow, line }
                 } else {
@@ -220,9 +247,10 @@ impl Lexer {
                         s.push(self.input[self.pos]);
                         self.pos += 1;
                     }
-                    if self.input[self.pos] == '\n' {
-                        panic!("Незакрытая строка на строке {}", line);
-                    }
+                    // НЕ проверяем на \n внутри строки — разрешаем многострочные строки
+                }
+                if self.pos >= self.input.len() {
+                    panic!("Незакрытая строка на строке {}", line);
                 }
                 self.pos += 1;
                 Token { kind: TokenKind::StringLit(s), line }
@@ -572,16 +600,41 @@ impl Parser {
                 self.advance();
                 let class = self.parse_identifier();
                 self.expect(TokenKind::LParen);
-                let mut args = Vec::new();
-                while self.current_token() != TokenKind::RParen {
-                    args.push(self.parse_expression(in_class, in_constructor, param_names));
-                    if self.current_token() == TokenKind::Comma { self.advance(); }
+
+                if class == "Thread" {
+                    let obj = self.parse_expression(in_class, in_constructor, param_names);
+                    self.expect(TokenKind::Comma);
+
+                    let code = match self.current_token() {
+                        TokenKind::StringLit(s) => {
+                            self.advance();
+                            s
+                        }
+                        _ => panic!("Thread: ожидается строка с кодом на строке {}", self.current_line()),
+                    };
+                    self.expect(TokenKind::RParen);
+                    Expression::Thread { obj: Box::new(obj), code }
+                } else {
+                    let mut args = Vec::new();
+                    while self.current_token() != TokenKind::RParen {
+                        args.push(self.parse_expression(in_class, in_constructor, param_names));
+                        if self.current_token() == TokenKind::Comma { self.advance(); }
+                    }
+                    self.expect(TokenKind::RParen);
+                    Expression::New { class, args }
                 }
-                self.expect(TokenKind::RParen);
-                Expression::New { class, args }
             }
             TokenKind::Identifier(name) => {
                 self.advance();
+
+                if self.current_token() == TokenKind::Increment {
+                    self.advance();
+                    return Expression::PostInc(Box::new(Expression::Variable(name)));
+                }
+                if self.current_token() == TokenKind::Decrement {
+                    self.advance();
+                    return Expression::PostDec(Box::new(Expression::Variable(name)));
+                }
 
                 if self.current_token() == TokenKind::LParen {
                     self.advance();
@@ -634,6 +687,14 @@ impl Parser {
             TokenKind::This => {
                 self.advance();
                 let mut expr = Expression::This;
+                if self.current_token() == TokenKind::Increment {
+                    self.advance();
+                    return Expression::PostInc(Box::new(expr));
+                }
+                if self.current_token() == TokenKind::Decrement {
+                    self.advance();
+                    return Expression::PostDec(Box::new(expr));
+                }
                 while self.current_token() == TokenKind::Dot {
                     self.advance();
                     let member = self.parse_identifier();
@@ -710,7 +771,7 @@ impl Parser {
                 self.expect(TokenKind::RParen);
                 Expression::Rand { max }
             }
-            TokenKind::Cgui => {
+            TokenKind::Cr => {
                 self.advance();
                 self.expect(TokenKind::Dot);
                 let func = self.parse_identifier();
@@ -721,7 +782,7 @@ impl Parser {
                     if self.current_token() == TokenKind::Comma { self.advance(); }
                 }
                 self.expect(TokenKind::RParen);
-                Expression::CguiCall { func, args }
+                Expression::CrCall { func, args }
             }
             TokenKind::Not => {
                 self.advance();
@@ -924,7 +985,7 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
     if import.path.first() == Some(&"llgui".to_string()) {
         let last = import.path.last().unwrap();
         if last == "*" {
-            let lp_dir = get_llgui_lib_path().join("llgui");
+            let lp_dir = libs::get_lib_path().join("llgui");
             if let Ok(entries) = fs::read_dir(&lp_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
@@ -934,11 +995,33 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
                 }
             }
         } else {
-            let lp_path = get_llgui_lib_path().join(format!("llgui/{}.lp", last));
+            let lp_path = libs::get_lib_path().join(format!("llgui/{}.lp", last));
             if lp_path.exists() {
                 load_file(&lp_path, root_path, classes, functions, processed);
             } else {
                 panic!("LLGUI class '{}' not found in builtin library", last);
+            }
+        }
+        return;
+    }
+    if import.path.first() == Some(&"llstd".to_string()) {
+        let last = import.path.last().unwrap();
+        if last == "*" {
+            let lp_dir = libs::get_lib_path().join("llstd");
+            if let Ok(entries) = fs::read_dir(&lp_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("lp") {
+                        load_file(&path, root_path, classes, functions, processed);
+                    }
+                }
+            }
+        } else {
+            let lp_path = libs::get_lib_path().join(format!("llstd/{}.lp", last));
+            if lp_path.exists() {
+                load_file(&lp_path, root_path, classes, functions, processed);
+            } else {
+                panic!("LLSTD class '{}' not found in builtin library", last);
             }
         }
         return;
@@ -986,20 +1069,31 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
     }
 }
 
-fn get_llgui_lib_path() -> std::path::PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    std::path::Path::new(&manifest_dir).join("libs/llgui_lib")
-}
-
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    if args.len() >= 2 && args[1] == "clean" {
+        let cache_dir = cache::get_cache_dir();
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir).expect("Failed to remove cache");
+            println!("🧹 Кэш очищен: {}", cache_dir.display());
+        } else {
+            println!("ℹ️  Кэш не найден: {}", cache_dir.display());
+        }
+        return;
+    }
+
     if args.len() < 2 {
         eprintln!("Использование: lopy <файл.lp> [--run]");
+        eprintln!("           lopy clean");
         std::process::exit(1);
     }
 
     let filename = &args[1];
     let should_run = args.contains(&"--run".to_string());
+
+    cache::ensure_dirs();
+    libs::ensure_libs();
 
     let source = fs::read_to_string(filename).expect("Не удалось прочитать файл");
     let mut lexer = Lexer::new(&source);
@@ -1036,33 +1130,75 @@ fn main() {
     };
 
     let ir = codegen::generate(&mut final_program);
-    fs::write("out.ll", &ir).expect("Не удалось записать IR");
-    let status = Command::new("llc").arg("out.ll").arg("-o").arg("out.s").status().expect("llc не найден");
-    if !status.success() { eprintln!("Ошибка компиляции IR в ассемблер"); std::process::exit(1); }
 
-    let out_name = if has_llgui { "gui" } else { "out" };
+    let source_hash = cache::hash_string(&source);
+    let cached_ll = cache::get_cache_dir().join(format!("{}.ll", source_hash));
+    fs::write(&cached_ll, &ir).expect("Не удалось записать IR в кэш");
 
-    let mut link_cmd = Command::new("clang");
-    link_cmd.args(&["out.s", "-o", out_name, "-no-pie"]);
-
-    if has_llgui {
-        let window_o_path = get_llgui_lib_path().join("window.o");
-        if window_o_path.exists() {
-            link_cmd.arg(&window_o_path);
-        } else {
-            eprintln!("Предупреждение: window.o не найден в {}", window_o_path.display());
-        }
-        link_cmd.arg("-lX11");
+    let cached_s = cache::get_cache_dir().join(format!("{}.s", source_hash));
+    let status = Command::new("llc")
+        .arg(&cached_ll)
+        .arg("-o")
+        .arg(&cached_s)
+        .status()
+        .expect("llc не найден");
+    if !status.success() {
+        eprintln!("Ошибка компиляции IR в ассемблер");
+        std::process::exit(1);
     }
 
+    let out_name = if has_llgui { "gui" } else { "out" };
+    let cached_bin = cache::get_cache_dir().join(format!("{}_{}", source_hash, out_name));
+
+    let mut link_cmd = Command::new("clang");
+    link_cmd.arg(&cached_s);
+    link_cmd.arg("-o");
+    link_cmd.arg(&cached_bin);
+    link_cmd.arg("-no-pie");
+
+    if has_llgui {
+        let llgui_o = libs::get_gui_lib_path().join("lib/llgui.o");
+        if llgui_o.exists() {
+            link_cmd.arg(llgui_o);
+        } else {
+            eprintln!("Ошибка: llgui.o не найден");
+            std::process::exit(1);
+        }
+
+        #[cfg(target_os = "linux")]
+        link_cmd.args(&["-lX11", "-lXrandr", "-lGL"]);
+
+        #[cfg(target_os = "windows")]
+        link_cmd.args(&["-lgdi32", "-lopengl32"]);
+
+        #[cfg(target_os = "macos")]
+        link_cmd.args(&["-framework Cocoa", "-framework OpenGL"]);
+    }
+
+    let llstd_o_path = libs::get_std_lib_path().join("lib/llstd.o");
+    if llstd_o_path.exists() {
+        link_cmd.arg(llstd_o_path);
+    }
+
+    link_cmd.arg("-lm");
+
     let status = link_cmd.status().expect("clang не найден");
-    if !status.success() { eprintln!("Ошибка линковки бинарника"); std::process::exit(1); }
+    if !status.success() {
+        eprintln!("Ошибка линковки бинарника");
+        std::process::exit(1);
+    }
 
     if should_run {
-        let output = Command::new(format!("./{}", out_name)).output().expect("Ошибка запуска программы");
+        let output = Command::new(&cached_bin)
+            .output()
+            .expect("Ошибка запуска программы");
         print!("{}", String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() { eprint!("{}", String::from_utf8_lossy(&output.stderr)); }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
     } else {
+        let dest = Path::new(&out_name);
+        fs::copy(&cached_bin, dest).expect("Не удалось скопировать бинарник");
         println!("✅ Скомпилировано в ./{}", out_name);
         if has_llgui {
             println!("   Запустите: ./gui");
