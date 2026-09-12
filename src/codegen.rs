@@ -32,7 +32,6 @@ pub fn generate(program: &mut Program) -> String {
     ir.push_str("declare i32 @sprintf(i8*, i8*, ...)\n");
     ir.push_str("declare i8* @fgets(i8*, i32, i8*)\n\n");
     ir.push_str("declare i64 @llvm.readcyclecounter()\n");
-    ir.push_str("declare void @pthread_exit(ptr)\n");
     ir.push_str("declare void @setbuf(i8*, i8*)\n");
     ir.push_str("declare void @free(i8*)\n");
     ir.push_str("declare i8* @__acrt_iob_func(i32)\n");
@@ -41,7 +40,7 @@ pub fn generate(program: &mut Program) -> String {
     ir.push_str("@.str.false_val = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n");
     ir.push_str("@.str.int_fmt = private unnamed_addr constant [3 x i8] c\"%d\\00\", align 1\n");
     ir.push_str("@.str.string_fmt = private unnamed_addr constant [3 x i8] c\"%s\\00\", align 1\n");
-    ir.push_str("@.str.num_fmt = private unnamed_addr constant [5 x i8] c\"%lld\\00\", align 1\n");
+    ir.push_str("@.str.num_fmt = private unnamed_addr constant [3 x i8] c\"%d\\00\", align 1\n");
     ir.push_str("@.str.string_fmt_clean = private unnamed_addr constant [8 x i8] c\" %[^\\n]\\00\", align 1\n");
     ir.push_str("@.input_error_int = private unnamed_addr constant [25 x i8] c\"Error: expected integer\\0A\\00\", align 1\n");
     ir.push_str("@.input_error_bool = private unnamed_addr constant [31 x i8] c\"Error: expected true or false\\0A\\00\", align 1\n");
@@ -202,6 +201,8 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
             ir.push_str("  call i32 @SetConsoleOutputCP(i32 65001)\n");
             ir.push_str("  call i32 @SetConsoleCP(i32 65001)\n");
         }
+        ir.push_str("  %stdout_file = call i8* @__acrt_iob_func(i32 1)\n");
+        ir.push_str("  call void @setbuf(i8* %stdout_file, i8* null)\n");
     }
 
     let mut param_counter = 0;
@@ -277,7 +278,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
                 }
             }
 
-            let fmt_parts: Vec<String> = types.iter().map(|t| if t == "i8*" { "%s" } else { "%lld" }).map(|s| s.to_string()).collect();
+            let fmt_parts: Vec<String> = types.iter().map(|t| if t == "i8*" { "%s" } else { "%d" }).map(|s| s.to_string()).collect();
             let fmt_str = fmt_parts.join(" ");
             let fmt_len = fmt_str.len() + 2;
 
@@ -297,7 +298,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             ir.push_str(&fmt_store);
             ir.push_str(&fmt_ptr);
             ir.push_str(&call_ir);
-            
+
             for reg in &temp_strings {
                 ir.push_str(&format!("  call void @free(i8* {})\n", reg));
             }
@@ -313,7 +314,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             *temp_counter += 1;
             let cmp_reg = format!("%cmp{}", *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = icmp ne i128 {}, 0\n", cmp_reg, cond_reg));
+            ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp_reg, cond_reg));
             ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n", cmp_reg, then_label, else_label));
 
             ir.push_str(&format!("{}:\n", then_label));
@@ -356,7 +357,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
 
             let cmp_reg = format!("%cmp{}", *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = icmp ne i128 {}, 0\n", cmp_reg, cond_reg));
+            ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp_reg, cond_reg));
             ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n", cmp_reg, body_label, end_label));
 
             ir.push_str(&format!("{}:\n", body_label));
@@ -384,7 +385,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
 
             let cmp_reg = format!("%cmp{}", *temp_counter);
             *temp_counter += 1;
-            ir.push_str(&format!("  {} = icmp ne i128 {}, 0\n", cmp_reg, cond_reg));
+            ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", cmp_reg, cond_reg));
             ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n", cmp_reg, body_label, end_label));
 
             ir.push_str(&format!("{}:\n", body_label));
@@ -407,9 +408,9 @@ fn get_struct_size(class_name: &str, program: &Program) -> usize {
 
     for field in &class_def.fields {
         let (size, align) = match field.type_ {
-            Type::Int => (16, 16),
+            Type::Int => (4, 4),
             Type::String => (8, 8),
-            Type::Bool => (1, 1),
+            Type::Bool => (4, 4),
             Type::Class(_) => (8, 8),
             Type::Void => (0, 8),
             Type::Func => (8, 8),
@@ -445,7 +446,7 @@ fn block_always_returns(body: &[Statement]) -> bool {
 
 fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut usize, string_counter: &mut usize, strings: &mut String, var_types: &HashMap<String, (String, String)>, current_class: Option<&Class>) -> (String, String, String, bool) {
     match expr {
-        Expression::Number(n) => (String::new(), n.to_string(), "i128".to_string(), false),
+        Expression::Number(n) => (String::new(), n.to_string(), "i32".to_string(), false),
         Expression::StringLit(s) => {
             let label = format!(".str{}", *string_counter);
             *string_counter += 1;
@@ -530,11 +531,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     return (ir, ptr, "i8*".to_string(), true);
                 }
 
-                if left_type == "i128" && right_type == "i8*" {
+                if left_type == "i32" && right_type == "i8*" {
                     let num_str = format!("%num_str{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = call i8* @malloc(i64 39)\n", num_str));
-                    ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.str.num_fmt, i32 0, i32 0), i128 {})\n", num_str, left_reg));
+                    ir.push_str(&format!("  {} = call i8* @malloc(i64 16)\n", num_str));
+                    ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.str.num_fmt, i32 0, i32 0), i32 {})\n", num_str, left_reg));
 
                     let len_left = format!("%len_left{}", *temp_counter);
                     let len_right = format!("%len_right{}", *temp_counter);
@@ -556,11 +557,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     return (ir, ptr, "i8*".to_string(), true);
                 }
 
-                if left_type == "i8*" && right_type == "i128" {
+                if left_type == "i8*" && right_type == "i32" {
                     let num_str = format!("%num_str{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = call i8* @malloc(i64 39)\n", num_str));
-                    ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.str.num_fmt, i32 0, i32 0), i128 {})\n", num_str, right_reg));
+                    ir.push_str(&format!("  {} = call i8* @malloc(i64 16)\n", num_str));
+                    ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.str.num_fmt, i32 0, i32 0), i32 {})\n", num_str, right_reg));
 
                     let len_left = format!("%len_left{}", *temp_counter);
                     let len_right = format!("%len_right{}", *temp_counter);
@@ -594,67 +595,67 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                         let eq_reg = format!("%eq{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", eq_reg, cmp_reg));
-                        ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, eq_reg));
+                        ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, eq_reg));
                     }
                     BinaryOperator::Ne => {
                         let ne_reg = format!("%ne{}", *temp_counter);
                         *temp_counter += 1;
                         ir.push_str(&format!("  {} = icmp ne i32 {}, 0\n", ne_reg, cmp_reg));
-                        ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, ne_reg));
+                        ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, ne_reg));
                     }
                     _ => {}
                 }
-                return (ir, result_reg, "i128".to_string(), false);
+                return (ir, result_reg, "i32".to_string(), false);
             }
 
             let result_reg = format!("%t{}", *temp_counter);
             *temp_counter += 1;
             match op {
-                BinaryOperator::Add => ir.push_str(&format!("  {} = add i128 {}, {}\n", result_reg, left_reg, right_reg)),
-                BinaryOperator::Sub => ir.push_str(&format!("  {} = sub i128 {}, {}\n", result_reg, left_reg, right_reg)),
-                BinaryOperator::Mul => ir.push_str(&format!("  {} = mul i128 {}, {}\n", result_reg, left_reg, right_reg)),
-                BinaryOperator::Div => ir.push_str(&format!("  {} = sdiv i128 {}, {}\n", result_reg, left_reg, right_reg)),
+                BinaryOperator::Add => ir.push_str(&format!("  {} = add i32 {}, {}\n", result_reg, left_reg, right_reg)),
+                BinaryOperator::Sub => ir.push_str(&format!("  {} = sub i32 {}, {}\n", result_reg, left_reg, right_reg)),
+                BinaryOperator::Mul => ir.push_str(&format!("  {} = mul i32 {}, {}\n", result_reg, left_reg, right_reg)),
+                BinaryOperator::Div => ir.push_str(&format!("  {} = sdiv i32 {}, {}\n", result_reg, left_reg, right_reg)),
                 BinaryOperator::Eq => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp eq i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp eq i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Ne => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp ne i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp ne i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Lt => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp slt i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp slt i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Le => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp sle i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp sle i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Gt => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp sgt i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp sgt i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Ge => {
                     let cmp = format!("%cmp{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = icmp sge i128 {}, {}\n", cmp, left_reg, right_reg));
-                    ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
+                    ir.push_str(&format!("  {} = icmp sge i32 {}, {}\n", cmp, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = zext i1 {} to i32\n", result_reg, cmp));
                 }
                 BinaryOperator::Rem => {
-                    ir.push_str(&format!("  {} = srem i128 {}, {}\n", result_reg, left_reg, right_reg));
+                    ir.push_str(&format!("  {} = srem i32 {}, {}\n", result_reg, left_reg, right_reg));
                 }
             }
-            (ir, result_reg, "i128".to_string(), false)
+            (ir, result_reg, "i32".to_string(), false)
         }
         Expression::Call { func, args } => {
             let mut ir = String::new();
@@ -683,8 +684,8 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             } else {
                 let call_reg = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
-                ir.push_str(&format!("  {} = call i128 @{}({})\n", call_reg, mangle_name(func), args_str.join(", ")));
-                (ir, call_reg, "i128".to_string(), false)
+                ir.push_str(&format!("  {} = call i32 @{}({})\n", call_reg, mangle_name(func), args_str.join(", ")));
+                (ir, call_reg, "i32".to_string(), false)
             }
         }
         Expression::MethodCall { object, method, args } => {
@@ -892,8 +893,8 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("{}:\n", ok_label));
                     let conv = format!("%conv{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = sext i64 {} to i128\n", conv, num));
-                    (ir, conv, "i128".to_string(), false)
+                    ir.push_str(&format!("  {} = trunc i64 {} to i32\n", conv, num));
+                    (ir, conv, "i32".to_string(), false)
                 }
                 InputType::Bool => {
                     let buf_reg = format!("%buf{}", *temp_counter);
@@ -935,16 +936,13 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  unreachable\n"));
                     ir.push_str(&format!("{}:\n", end_label));
                     ir.push_str(&format!("  {} = load i32, i32* {}\n", buf_reg, alloca_reg));
-                    let conv_reg = format!("%t{}", *temp_counter);
-                    *temp_counter += 1;
-                    ir.push_str(&format!("  {} = sext i32 {} to i128\n", conv_reg, buf_reg));
-                    (ir, conv_reg, "i128".to_string(), false)
+                    (ir, buf_reg, "i32".to_string(), false)
                 }
             }
         }
         Expression::Rand { max } => {
             let seed_ptr = "@rand_seed";
-            let llvm_seed_type = "i128";
+            let llvm_seed_type = "i32";
 
             if !strings.contains(seed_ptr) {
                 strings.push_str(&format!("{} = global {} 0\n", seed_ptr, llvm_seed_type));
@@ -964,13 +962,13 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let mut ir = String::new();
 
             ir.push_str(&format!("  {} = load {}, {}* {}\n", seed_load, llvm_seed_type, llvm_seed_type, seed_ptr));
-            ir.push_str(&format!("  {} = icmp eq i128 {}, 0\n", is_init, seed_load));
+            ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", is_init, seed_load));
             ir.push_str(&format!("  br i1 {}, label %{}, label %{}\n", is_init, init_label, after_init));
 
             ir.push_str(&format!("{}:\n", init_label));
             ir.push_str("  %tsc_tmp = call i64 @llvm.readcyclecounter()\n");
-            ir.push_str(&format!("  {} = zext i64 %tsc_tmp to i128\n", tsc));
-            ir.push_str(&format!("  store i128 {}, i128* {}\n", tsc, seed_ptr));
+            ir.push_str(&format!("  {} = trunc i64 %tsc_tmp to i32\n", tsc));
+            ir.push_str(&format!("  store i32 {}, i32* {}\n", tsc, seed_ptr));
             ir.push_str(&format!("  br label %{}\n", after_init));
 
             ir.push_str(&format!("{}:\n", after_init));
@@ -985,10 +983,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             *temp_counter += 1;
 
             ir.push_str(&format!("  {} = load {}, {}* {}\n", seed_val, llvm_seed_type, llvm_seed_type, seed_ptr));
-            ir.push_str(&format!("  {} = mul i128 {}, 1103515245\n", mul_result, seed_val));
-            ir.push_str(&format!("  {} = add i128 {}, 12345\n", add_result, mul_result));
-            ir.push_str(&format!("  store i128 {}, i128* {}\n", add_result, seed_ptr));
-            ir.push_str(&format!("  {} = sdiv i128 {}, 65536\n", rand_val, add_result));
+            ir.push_str(&format!("  {} = mul i32 {}, 1103515245\n", mul_result, seed_val));
+            ir.push_str(&format!("  {} = add i32 {}, 12345\n", add_result, mul_result));
+            ir.push_str(&format!("  store i32 {}, i32* {}\n", add_result, seed_ptr));
+            ir.push_str(&format!("  {} = sdiv i32 {}, 65536\n", rand_val, add_result));
 
             if let Some(max_expr) = max {
                 let (max_ir, max_reg, _, _) = generate_expression(program, max_expr, temp_counter, string_counter, strings, var_types, current_class);
@@ -997,11 +995,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 *temp_counter += 1;
                 let final_result = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
-                ir.push_str(&format!("  {} = srem i128 {}, {}\n", srem_result, rand_val, max_reg));
-                ir.push_str(&format!("  {} = add i128 {}, 1\n", final_result, srem_result));
-                (ir, final_result, "i128".to_string(), false)
+                ir.push_str(&format!("  {} = srem i32 {}, {}\n", srem_result, rand_val, max_reg));
+                ir.push_str(&format!("  {} = add i32 {}, 1\n", final_result, srem_result));
+                (ir, final_result, "i32".to_string(), false)
             } else {
-                (ir, rand_val, "i128".to_string(), false)
+                (ir, rand_val, "i32".to_string(), false)
             }
         }
         Expression::CrCall { func, args } => {
@@ -1028,7 +1026,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             for arg_type in &arg_types {
                 declare_args.push(match arg_type.as_str() {
                     "i8*" => "i8*",
-                    "i128" => "i128",
+                    "i32" => "i32",
                     _ => "i32",
                 });
             }
@@ -1055,9 +1053,9 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let cmp = format!("%cmp{}", *temp_counter);
             *temp_counter += 1;
             let mut new_ir = ir;
-            new_ir.push_str(&format!("  {} = icmp eq i128 {}, 0\n", cmp, reg));
-            new_ir.push_str(&format!("  {} = zext i1 {} to i128\n", result, cmp));
-            (new_ir, result, "i128".to_string(), false)
+            new_ir.push_str(&format!("  {} = icmp eq i32 {}, 0\n", cmp, reg));
+            new_ir.push_str(&format!("  {} = zext i1 {} to i32\n", result, cmp));
+            (new_ir, result, "i32".to_string(), false)
         }
         Expression::Thread { obj, code } => {
             let (obj_ir, obj_reg, obj_type, _) = generate_expression(program, obj, temp_counter, string_counter, strings, var_types, current_class);
@@ -1092,11 +1090,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let new_val = format!("%new_{}", *temp_counter);
             *temp_counter += 1;
 
-            ir.push_str(&format!("  {} = load i128, i128* {}\n", old_val, var_ptr));
-            ir.push_str(&format!("  {} = add i128 {}, 1\n", new_val, old_val));
-            ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
+            ir.push_str(&format!("  {} = load i32, i32* {}\n", old_val, var_ptr));
+            ir.push_str(&format!("  {} = add i32 {}, 1\n", new_val, old_val));
+            ir.push_str(&format!("  store i32 {}, i32* {}\n", new_val, var_ptr));
 
-            (ir, old_val, "i128".to_string(), false)
+            (ir, old_val, "i32".to_string(), false)
         }
         Expression::PostDec(expr) => {
             let (mut ir, _, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
@@ -1112,11 +1110,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let new_val = format!("%new_{}", *temp_counter);
             *temp_counter += 1;
 
-            ir.push_str(&format!("  {} = load i128, i128* {}\n", old_val, var_ptr));
-            ir.push_str(&format!("  {} = sub i128 {}, 1\n", new_val, old_val));
-            ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
+            ir.push_str(&format!("  {} = load i32, i32* {}\n", old_val, var_ptr));
+            ir.push_str(&format!("  {} = sub i32 {}, 1\n", new_val, old_val));
+            ir.push_str(&format!("  store i32 {}, i32* {}\n", new_val, var_ptr));
 
-            (ir, old_val, "i128".to_string(), false)
+            (ir, old_val, "i32".to_string(), false)
         }
         Expression::Lambda { body } => {
             let mut captures = Vec::new();
@@ -1344,9 +1342,10 @@ fn mangle_name(name: &str) -> String {
 
 fn llvm_type(t: &Type) -> String {
     match t {
-        Type::Int => "i128".to_string(),
+        Type::Int => "i32".to_string(),
         Type::String => "i8*".to_string(),
-        Type::Bool => "i128".to_string(),
+        Type::Bool => "i32".to_string(),
+        //TODO: long => "i64", big => "i128"
         Type::Void => "void".to_string(),
         Type::Class(name) => format!("%{}*", mangle_name(name)),
         Type::Func => "i8*".to_string(),
