@@ -1,15 +1,19 @@
 mod ast;
 mod codegen;
 mod cache;
-mod libs;
+mod pkg;
 
 use crate::ast::*;
 use std::env;
 use std::fs;
 use std::process::Command;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use home::home_dir;
+use tar::Archive;
 use unicode_xid::UnicodeXID;
+
+const LLVM_MINGW_VERSION: &str = "20260616";
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Token {
@@ -28,7 +32,7 @@ pub enum TokenKind {
     EOF, Else, ColonColon, FnOut, BoolType,
     EqEq, Neq, Lt, Le, Gt, Ge, Rand,
     Input, While, For, Import, Cr, Increment,
-    Decrement,
+    Decrement, Percent,
 }
 
 pub struct Lexer {
@@ -145,6 +149,22 @@ impl Lexer {
             return self.next_token();
         }
 
+        if self.pos + 1 < self.input.len() && self.input[self.pos] == '/' && self.input[self.pos + 1] == '*' {
+            self.pos += 2;
+            while self.pos + 1 < self.input.len() && !(self.input[self.pos] == '*' && self.input[self.pos + 1] == '/') {
+                if self.input[self.pos] == '\n' {
+                    self.line += 1;
+                }
+                self.pos += 1;
+            }
+            if self.pos + 1 >= self.input.len() {
+                panic!("Незакрытый многострочный комментарий на строке {}", self.line);
+            }
+            self.pos += 2;
+            self.skip_whitespace();
+            return self.next_token();
+        }
+
         let ch = self.input[self.pos];
         let line = self.line;
         match ch {
@@ -156,6 +176,10 @@ impl Lexer {
                 } else {
                     Token { kind: TokenKind::Assign, line }
                 }
+            }
+            '%' => {
+                self.pos += 1;
+                Token { kind: TokenKind::Percent, line }
             }
             '!' => {
                 self.pos += 1;
@@ -325,6 +349,10 @@ impl Parser {
             TokenKind::Identifier(ref name) if name == "void" => {
                 self.advance();
                 Type::Void
+            }
+            TokenKind::Identifier(ref name) if name == "func" => {
+                self.advance();
+                Type::Func
             }
             TokenKind::Identifier(name) => { self.advance(); Type::Class(name) }
             _ => panic!("Ожидался тип на строке {}", self.current_line()),
@@ -582,10 +610,15 @@ impl Parser {
 
     fn parse_multiplicative(&mut self, in_class: bool, in_constructor: bool, param_names: &HashSet<String>) -> Expression {
         let mut left = self.parse_primary(in_class, in_constructor, param_names);
-        while self.current_token() == TokenKind::Star {
+        while self.current_token() == TokenKind::Star || self.current_token() == TokenKind::Percent {
+            let op = match self.current_token() {
+                TokenKind::Star => BinaryOperator::Mul,
+                TokenKind::Percent => BinaryOperator::Rem,
+                _ => unreachable!(),
+            };
             self.advance();
             let right = self.parse_primary(in_class, in_constructor, param_names);
-            left = Expression::BinaryOp { left: Box::new(left), op: BinaryOperator::Mul, right: Box::new(right) };
+            left = Expression::BinaryOp { left: Box::new(left), op, right: Box::new(right) };
         }
         left
     }
@@ -623,6 +656,16 @@ impl Parser {
                     self.expect(TokenKind::RParen);
                     Expression::New { class, args }
                 }
+            }
+            TokenKind::Identifier(ref name) if name == "func" => {
+                self.advance();
+                self.expect(TokenKind::LBrace);
+                let mut body = Vec::new();
+                while self.current_token() != TokenKind::RBrace {
+                    body.push(self.parse_statement(in_class, in_constructor, param_names));
+                }
+                self.expect(TokenKind::RBrace);
+                Expression::Lambda { body }
             }
             TokenKind::Identifier(name) => {
                 self.advance();
@@ -982,51 +1025,92 @@ fn load_file(path: &std::path::Path, root_path: &std::path::Path, classes: &mut 
 }
 
 fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: &mut Vec<Class>, functions: &mut Vec<Function>, processed: &mut HashSet<std::path::PathBuf>) {
-    if import.path.first() == Some(&"llgui".to_string()) {
-        let last = import.path.last().unwrap();
-        if last == "*" {
-            let lp_dir = libs::get_lib_path().join("llgui");
-            if let Ok(entries) = fs::read_dir(&lp_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("lp") {
-                        load_file(&path, root_path, classes, functions, processed);
+    // 1. Проверяем: это пакет из зависимостей?
+    if let Some(project) = pkg::read_project_toml() {
+        if let Some(deps) = project.dependencies {
+            if let Some(pkg_name) = import.path.first() {
+                if let Some(version) = deps.get(pkg_name) {
+                    // Это зависимость! Ищем в ~/.lopy/packages/
+                    let pkg_path = pkg::resolve_package(pkg_name, version);
+
+                    // Проверяем что импортируется
+                    if import.path.len() == 1 {
+                        // Только имя пакета: import llgui;
+                        // Загружаем ВСЕ .lp файлы из корня пакета (не рекурсивно!)
+                        if let Ok(entries) = fs::read_dir(&pkg_path) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lp") {
+                                    load_file(&path, &pkg_path, classes, functions, processed);
+                                }
+                            }
+                        }
+                        return;
+                    } else if import.path.len() == 2 && import.path[1] == "*" {
+                        // import llgui::*;
+                        // Загружаем ВСЕ .lp файлы из корня пакета (не рекурсивно!)
+                        if let Ok(entries) = fs::read_dir(&pkg_path) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lp") {
+                                    load_file(&path, &pkg_path, classes, functions, processed);
+                                }
+                            }
+                        }
+                        return;
+                    } else {
+                        // import llgui::Window; или import llgui::widgets::Button;
+                        // Строим путь внутри пакета
+                        let mut file_path = pkg_path.clone();
+                        for segment in &import.path[1..] {
+                            file_path.push(segment);
+                        }
+                        let lp_file = file_path.with_extension("lp");
+
+                        if lp_file.exists() {
+                            load_file(&lp_file, &pkg_path, classes, functions, processed);
+                            return;
+                        } else {
+                            panic!("❌ Файл {} не найден в пакете {}", lp_file.display(), pkg_name);
+                        }
                     }
                 }
             }
-        } else {
-            let lp_path = libs::get_lib_path().join(format!("llgui/{}.lp", last));
-            if lp_path.exists() {
-                load_file(&lp_path, root_path, classes, functions, processed);
-            } else {
-                panic!("LLGUI class '{}' not found in builtin library", last);
-            }
         }
-        return;
-    }
-    if import.path.first() == Some(&"llstd".to_string()) {
-        let last = import.path.last().unwrap();
-        if last == "*" {
-            let lp_dir = libs::get_lib_path().join("llstd");
-            if let Ok(entries) = fs::read_dir(&lp_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) == Some("lp") {
-                        load_file(&path, root_path, classes, functions, processed);
-                    }
-                }
-            }
-        } else {
-            let lp_path = libs::get_lib_path().join(format!("llstd/{}.lp", last));
-            if lp_path.exists() {
-                load_file(&lp_path, root_path, classes, functions, processed);
-            } else {
-                panic!("LLSTD class '{}' not found in builtin library", last);
-            }
-        }
-        return;
     }
 
+    // 2. Специальная обработка для llstd (встроен в компилятор)
+    if import.path.first() == Some(&"llstd".to_string()) {
+        let llstd_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/llstd");
+
+        if import.path.len() == 1 || import.path[1] == "*" {
+            // import llstd; или import llstd::*;
+            if let Ok(entries) = fs::read_dir(&llstd_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lp") {
+                        load_file(&path, &llstd_dir, classes, functions, processed);
+                    }
+                }
+            }
+            return;
+        } else {
+            // import llstd::Something;
+            let mut file_path = llstd_dir.clone();
+            for segment in &import.path[1..] {
+                file_path.push(segment);
+            }
+            let lp_file = file_path.with_extension("lp");
+            if lp_file.exists() {
+                load_file(&lp_file, &llstd_dir, classes, functions, processed);
+                return;
+            } else {
+                panic!("❌ llstd class not found: {}", lp_file.display());
+            }
+        }
+    }
+
+    // 3. ВСЁ ОСТАЛЬНОЕ - ищем локально (по старой логике)
     if import.path.is_empty() {
         return;
     }
@@ -1043,14 +1127,14 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
     }
 
     if !dir_path.exists() {
-        panic!("Папка не найдена: {}", dir_path.display());
+        panic!("❌ Папка не найдена: {}", dir_path.display());
     }
 
     let mut lp_files = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir_path) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("lp") {
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("lp") {
                 lp_files.push(path);
             }
         }
@@ -1060,7 +1144,7 @@ fn load_import_recursive(import: &Import, root_path: &std::path::Path, classes: 
         let target_name = format!("{}.lp", name);
         lp_files.retain(|p| p.file_name().and_then(|n| n.to_str()) == Some(&target_name));
         if lp_files.is_empty() {
-            panic!("Файл {}.lp не найден в {}", name, dir_path.display());
+            panic!("❌ Файл {}.lp не найден в {}", name, dir_path.display());
         }
     }
 
@@ -1078,60 +1162,209 @@ pub fn check_tool_in_system(name: &str) -> bool {
 }
 
 pub fn ensure_tools() {
-    let tools = ["clang", "llc", "lld"];
+    let lopy_dir = home_dir()
+        .expect("Home dir not found")
+        .join(".lopy");
 
-    for tool in tools {
-        if !check_tool_in_system(tool) {
-            println!("⚠️ {} не найден.", tool);
-            println!("   Установите LLVM через пакетный менеджер:");
-            println!("   Arch:    sudo pacman -S clang llvm");
-            println!("   Ubuntu:  sudo apt install clang llvm");
-            println!("   Windows: https://releases.llvm.org/");
+    // Склад версий: ~/.lopy/bin/llvm-mingw-<версия>/
+    let version_dir_name = format!("llvm-mingw-{}-ucrt-x86_64", LLVM_MINGW_VERSION);
+    let bin_dir = lopy_dir.join("bin");
+    let llvm_root = bin_dir.join(&version_dir_name);
+    let llvm_bin = llvm_root.join("bin");
+    let clang_path = llvm_bin.join("clang.exe");
+
+    // 1. Проверяем, есть ли уже полная версия
+    if clang_path.exists() {
+        let lib_mingw = llvm_root
+            .join("x86_64-w64-mingw32")
+            .join("lib")
+            .join("libmingw32.a");
+        if lib_mingw.exists() {
+            println!("✅ LLVM {} уже на месте.", LLVM_MINGW_VERSION);
+            let _ = onpath::add(&llvm_bin, "lopy-llvm");
+            return;
+        }
+    }
+
+    // 2. Качаем полный архив
+    println!("⏳ LLVM не найден. Скачиваю полный llvm-mingw {}...", LLVM_MINGW_VERSION);
+
+    let url = format!(
+        "https://github.com/mstorsjo/llvm-mingw/releases/download/{}/llvm-mingw-{}-ucrt-x86_64.zip",
+        LLVM_MINGW_VERSION, LLVM_MINGW_VERSION
+    );
+
+    fs::create_dir_all(&bin_dir).expect("Не удалось создать ~/.lopy/bin");
+
+    // 3. Временная папка
+    let tmp_dir = lopy_dir.join("_tmp_llvm");
+    fs::create_dir_all(&tmp_dir).expect("Не удалось создать tmp dir");
+
+    // 4. Скачиваем и распаковываем целиком
+    let mut archive = match arkiv::Archive::download(&url) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("❌ Не удалось скачать LLVM: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = archive.unpack(&tmp_dir) {
+        eprintln!("❌ Не удалось распаковать архив: {}", e);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        std::process::exit(1);
+    }
+
+    // 5. Находим внутреннюю папку llvm-mingw-*
+    let inner = fs::read_dir(&tmp_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("llvm-mingw-"))
+                .unwrap_or(false)
+        })
+        .expect("Внутри архива не найдена папка llvm-mingw-*");
+
+    // 6. Перемещаем ЦЕЛИКОМ в ~/.lopy/bin/llvm-mingw-<версия>/
+    if llvm_root.exists() {
+        let _ = fs::remove_dir_all(&llvm_root);
+    }
+
+    fs::rename(&inner, &llvm_root)
+        .or_else(|_| copy_dir_recursive(&inner, &llvm_root))
+        .expect("Не удалось переместить llvm-mingw");
+
+    // 7. Сносим временную папку
+    let _ = fs::remove_dir_all(&tmp_dir);
+
+    // 10. Финальная проверка
+    if !clang_path.exists() {
+        eprintln!("❌ clang всё ещё не найден после установки.");
+        std::process::exit(1);
+    }
+
+    println!("🎉 LLVM {} готов к работе!", LLVM_MINGW_VERSION);
+}
+
+fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+// Пути для вызова clang/lld
+pub fn get_llvm_root() -> PathBuf {
+    home_dir()
+        .expect("no home dir")
+        .join(".lopy")
+        .join("bin")
+        .join(format!("llvm-mingw-{}-ucrt-x86_64", LLVM_MINGW_VERSION))
+}
+
+/// Папка с бинарниками: ~/.lopy/bin/llvm-mingw-<версия>/bin/
+pub fn get_llvm_bin_path() -> PathBuf {
+    get_llvm_root().join("bin")
+}
+
+/// Папка с библиотеками: ~/.lopy/bin/llvm-mingw-<версия>/x86_64-w64-mingw32/lib/
+pub fn get_llvm_lib_path() -> PathBuf {
+    get_llvm_root()
+        .join("x86_64-w64-mingw32")
+        .join("lib")
+}
+
+/// Полный путь к clang
+pub fn clang_path() -> PathBuf {
+    get_llvm_bin_path().join("clang.exe")
+}
+
+/// Полный путь к lld
+pub fn lld_path() -> PathBuf {
+    get_llvm_bin_path().join("lld.exe")
+}
+
+fn handle_clean() {
+    let cache_dir = cache::get_cache_dir();
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir).expect("Failed to remove cache");
+        println!("🧹 Кэш очищен: {}", cache_dir.display());
+    } else {
+        println!("ℹ️  Кэш не найден: {}", cache_dir.display());
+    }
+}
+
+fn handle_pkg(args: &[String]) {
+    pkg::ensure_dirs();
+
+    match args[0].as_str() {
+        "add" => {
+            if args.len() < 2 {
+                eprintln!("Использование: lopy pkg add <name> [version] [url]");
+                std::process::exit(1);
+            }
+            let name = &args[1];
+            let version = if args.len() >= 3 { &args[2] } else { "latest" };
+            let url = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
+            pkg::add_package(name, version, url);
+        }
+        "remove" => {
+            if args.len() < 2 {
+                eprintln!("Использование: lopy pkg remove <name>");
+                std::process::exit(1);
+            }
+            pkg::remove_package(&args[1]);
+        }
+        "list" => {
+            pkg::list_packages();
+        }
+        _ => {
+            eprintln!("Неизвестная команда pkg: {}", args[0]);
+            eprintln!("Доступные: add, remove, list");
             std::process::exit(1);
         }
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() >= 2 && args[1] == "clean" {
-        let cache_dir = cache::get_cache_dir();
-        if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir).expect("Failed to remove cache");
-            println!("🧹 Кэш очищен: {}", cache_dir.display());
-        } else {
-            println!("ℹ️  Кэш не найден: {}", cache_dir.display());
-        }
-        return;
-    }
-
-    if args.len() < 2 {
-        eprintln!("Использование: lopy <файл.lp> [--run]");
-        eprintln!("           lopy clean");
-        std::process::exit(1);
-    }
-
-    let filename = &args[1];
-    let should_run = args.contains(&"--run".to_string());
-
-    cache::ensure_dirs();
-    libs::ensure_libs();
-    ensure_tools();
-
-    let source = fs::read_to_string(filename).expect("Не удалось прочитать файл");
+fn compile_file(
+    filename: &str,
+    out_name: &str,
+    should_run: bool,
+    link_objects: Vec<PathBuf>,
+    link_flags: Vec<String>,
+) -> Result<(), String> {
+    let source = fs::read_to_string(filename)
+        .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
     let mut lexer = Lexer::new(&source);
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
-        if token.kind == TokenKind::EOF { break; }
+        if token.kind == TokenKind::EOF {
+            break;
+        }
         tokens.push(token);
     }
 
     let mut parser = Parser::new(tokens);
     let (program, imports) = parser.parse_program();
 
-    let root_path = std::path::Path::new(filename).parent().unwrap().canonicalize().unwrap();
+    let root_path = std::path::Path::new(filename)
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
     let main_abs_path = std::fs::canonicalize(filename).unwrap();
 
     let mut processed = HashSet::new();
@@ -1153,81 +1386,351 @@ fn main() {
         functions: all_functions,
     };
 
+    let mut all_signatures = HashMap::new();
+
+    if let Some(project) = pkg::read_project_toml() {
+        if let Some(deps) = project.dependencies {
+            for (name, version) in deps {
+                let pkg_dir = pkg::get_packages_dir().join(format!("{}@{}", name, version));
+                let lib_dir = pkg_dir.join("lib");
+
+                if let Ok(entries) = fs::read_dir(&lib_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("c") {
+                            let sigs = pkg::parse_c_signatures(&path);
+                            all_signatures.extend(sigs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    codegen::set_c_signatures(all_signatures);
+
+    // 1. Генерируем IR
     let ir = codegen::generate(&mut final_program);
 
     let source_hash = cache::hash_string(&source);
     let cached_ll = cache::get_cache_dir().join(format!("{}.ll", source_hash));
-    fs::write(&cached_ll, &ir).expect("Не удалось записать IR в кэш");
+    fs::write(&cached_ll, &ir)
+        .map_err(|e| format!("Не удалось записать IR: {}", e))?;
 
-    let cached_s = cache::get_cache_dir().join(format!("{}.s", source_hash));
-    let status = Command::new("llc")
+    // 2. .ll -> .o через clang (без ассемблера)
+    let cached_o = cache::get_cache_dir().join(format!("{}.o", source_hash));
+    let status = Command::new(clang_path())
+        .arg("-c")           // компилировать в объектник
         .arg(&cached_ll)
         .arg("-o")
-        .arg(&cached_s)
+        .arg(&cached_o)
         .status()
-        .expect("llc не найден");
+        .map_err(|_| "clang не найден".to_string())?;
     if !status.success() {
-        eprintln!("Ошибка компиляции IR в ассемблер");
-        std::process::exit(1);
+        return Err("Ошибка компиляции IR в объектник".to_string());
     }
 
-    let out_name = if has_llgui { "gui" } else { "out" };
-    let cached_bin = cache::get_cache_dir().join(format!("{}_{}", source_hash, out_name));
+    // 3. .o -> exe через clang + lld
+    let out_name_final = out_name.to_string();
+    let cached_bin = cache::get_cache_dir().join(format!("{}_{}", source_hash, out_name_final));
 
-    let mut link_cmd = Command::new("clang");
-    link_cmd.arg(&cached_s);
+    let mut link_cmd = Command::new(clang_path());
+    link_cmd.arg(&cached_o);       // объектник вместо .s
     link_cmd.arg("-o");
     link_cmd.arg(&cached_bin);
-    link_cmd.arg("-no-pie");
+    link_cmd.arg("-fuse-ld=lld");
+    link_cmd.arg(format!("-Wl,-L{}", get_llvm_lib_path().display()));
+    link_cmd.arg("-lwinpthread");
+    link_cmd.arg("-lucrt");
+    link_cmd.arg("-lmsvcrt");
 
-    if has_llgui {
-        let llgui_o = libs::get_gui_lib_path().join("lib/llgui.o");
-        if llgui_o.exists() {
-            link_cmd.arg(llgui_o);
-        } else {
-            eprintln!("Ошибка: llgui.o не найден");
-            std::process::exit(1);
-        }
-
-        #[cfg(target_os = "linux")]
-        link_cmd.args(&["-lX11", "-lXrandr", "-lGL"]);
-
-        #[cfg(target_os = "windows")]
-        link_cmd.args(&["-lgdi32", "-lopengl32"]);
-
-        #[cfg(target_os = "macos")]
-        link_cmd.args(&["-framework Cocoa", "-framework OpenGL"]);
+    for obj in link_objects {
+        link_cmd.arg(obj);
     }
 
-    let llstd_o_path = libs::get_std_lib_path().join("lib/llstd.o");
-    if llstd_o_path.exists() {
-        link_cmd.arg(llstd_o_path);
+    for flag in link_flags {
+        link_cmd.arg(flag);
     }
 
+    let llstd_o = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/llstd/lib")
+        .join(match std::env::consts::OS {
+            "linux" => "llstd_linux.o",
+            "windows" => "llstd_windows.o",
+            "macos" => "llstd_macos.o",
+            _ => panic!("❌ Неподдерживаемая платформа: {}", std::env::consts::OS),
+        });
+
+    if llstd_o.exists() {
+        link_cmd.arg(&llstd_o);
+    }
+
+    // -lm только на Linux, на MinGW не нужно
+    #[cfg(target_os = "linux")]
     link_cmd.arg("-lm");
 
-    let status = link_cmd.status().expect("clang не найден");
+    let status = link_cmd
+        .status()
+        .map_err(|_| "clang не найден".to_string())?;
     if !status.success() {
-        eprintln!("Ошибка линковки бинарника");
+        return Err("Ошибка линковки бинарника".to_string());
+    }
+
+    // 4. Запуск или копирование
+    if should_run {
+        let status = Command::new(&cached_bin)
+            .status()
+            .map_err(|_| "Ошибка запуска программы".to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "Программа завершилась с кодом {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+    } else {
+        let dest = Path::new(&out_name_final);
+        fs::copy(&cached_bin, dest)
+            .map_err(|e| format!("Не удалось скопировать бинарник: {}", e))?;
+    }
+
+    Ok(())
+}
+
+fn handle_build() {
+    let args: Vec<String> = env::args().collect();
+    let mut project_path = PathBuf::from(".");
+    let mut i = 2; // пропускаем "lopy build"
+    while i < args.len() {
+        if args[i] == "--project" || args[i] == "-p" {
+            if i + 1 < args.len() {
+                project_path = PathBuf::from(&args[i + 1]);
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Сохраняем текущую директорию
+    let original_dir = env::current_dir().unwrap();
+
+    // Переходим в папку проекта
+    if project_path != PathBuf::from(".") {
+        std::env::set_current_dir(&project_path).expect("Не удалось перейти в папку проекта");
+        println!("📁 Перешли в: {}", project_path.display());
+    }
+
+    let project = pkg::read_project_toml();
+    if project.is_none() {
+        eprintln!("⚠️  lopy.toml не найден в {}", project_path.display());
+        std::process::exit(1);
+    }
+    let project = project.unwrap();
+
+    let main_path = Path::new("src/main.lp");
+    if !main_path.exists() {
+        eprintln!("⚠️  src/main.lp не найден в {}", project_path.display());
         std::process::exit(1);
     }
 
-    if should_run {
-        let output = Command::new(&cached_bin)
-            .output()
-            .expect("Ошибка запуска программы");
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        if !output.stderr.is_empty() {
-            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    println!("🔨 Сборка проекта {} v{}", project.package.name, project.package.version);
+
+    let mut link_objects = Vec::new();
+    let mut link_flags = Vec::new();
+
+    if let Some(deps) = project.dependencies {
+        for (name, version) in deps {
+            let pkg_path = pkg::resolve_package(&name, &version);
+            println!("📦 Используем пакет {} из {}", name, pkg_path.display());
+
+            if let Ok((obj_path, flags)) = pkg::compile_package(&name, &version) {
+                if obj_path.exists() {
+                    link_objects.push(obj_path);
+                    link_flags.extend(flags);
+                }
+            }
         }
+    }
+
+    if let Err(e) = compile_file(main_path.to_str().unwrap(), &project.package.name, false, link_objects, link_flags) {
+        eprintln!("❌ Ошибка сборки: {}", e);
+        std::process::exit(1);
+    }
+
+    let build_dir = Path::new("build");
+    fs::create_dir_all(build_dir).expect("Не удалось создать папку build");
+
+    let binary_name = &project.package.name;
+    let source_bin = Path::new(&binary_name);
+    let dest_bin = build_dir.join(binary_name);
+
+    if source_bin.exists() {
+        fs::copy(source_bin, &dest_bin).expect("Не удалось скопировать бинарник");
+        println!("✅ Бинарник скопирован в {}", dest_bin.display());
+        fs::remove_file(source_bin).unwrap_or_default();
     } else {
-        let dest = Path::new(&out_name);
-        fs::copy(&cached_bin, dest).expect("Не удалось скопировать бинарник");
-        println!("✅ Скомпилировано в ./{}", out_name);
-        if has_llgui {
-            println!("   Запустите: ./gui");
-        } else {
-            println!("   Запустите: ./out");
+        eprintln!("❌ Бинарник не найден");
+        std::process::exit(1);
+    }
+
+    // Возвращаемся обратно
+    std::env::set_current_dir(&original_dir).unwrap();
+}
+
+fn handle_run() {
+    let args: Vec<String> = env::args().collect();
+    let mut project_path = PathBuf::from(".");
+    let mut i = 2; // пропускаем "lopy run"
+    while i < args.len() {
+        if args[i] == "--project" || args[i] == "-p" {
+            if i + 1 < args.len() {
+                project_path = PathBuf::from(&args[i + 1]);
+                i += 2;
+                continue;
+            }
         }
+        i += 1;
+    }
+
+    // Сохраняем текущую директорию
+    let original_dir = env::current_dir().unwrap();
+
+    // Переходим в папку проекта
+    if project_path != PathBuf::from(".") {
+        std::env::set_current_dir(&project_path).expect("Не удалось перейти в папку проекта");
+        println!("📁 Перешли в: {}", project_path.display());
+    }
+
+    let project = pkg::read_project_toml();
+    if project.is_none() {
+        eprintln!("⚠️  lopy.toml не найден в {}", project_path.display());
+        std::process::exit(1);
+    }
+    let project = project.unwrap();
+
+    let main_path = Path::new("src/main.lp");
+    if !main_path.exists() {
+        eprintln!("⚠️  src/main.lp не найден в {}", project_path.display());
+        std::process::exit(1);
+    }
+
+    println!("🚀 Запуск проекта {} v{}", project.package.name, project.package.version);
+
+    let mut link_objects = Vec::new();
+    let mut link_flags = Vec::new();
+
+    if let Some(deps) = project.dependencies {
+        for (name, version) in deps {
+            let pkg_path = pkg::resolve_package(&name, &version);
+            println!("📦 Используем пакет {} из {}", name, pkg_path.display());
+
+            if let Ok((obj_path, flags)) = pkg::compile_package(&name, &version) {
+                if obj_path.exists() {
+                    link_objects.push(obj_path);
+                    link_flags.extend(flags);
+                }
+            }
+        }
+    }
+
+    if let Err(e) = compile_file(main_path.to_str().unwrap(), &project.package.name, true, link_objects, link_flags) {
+        eprintln!("❌ Ошибка выполнения: {}", e);
+        std::process::exit(1);
+    }
+
+    // Возвращаемся обратно
+    std::env::set_current_dir(&original_dir).unwrap();
+}
+
+fn handle_create(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("Использование: lopy create <project_name>");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+    let project_dir = Path::new(name);
+
+    if project_dir.exists() {
+        eprintln!("❌ Папка {} уже существует", name);
+        std::process::exit(1);
+    }
+
+    // Создаём структуру
+    fs::create_dir_all(project_dir.join("src")).expect("Failed to create src dir");
+
+    // lopy.toml
+    let toml_content = format!(
+        r#"[package]
+name = "{}"
+version = "0.1.0"
+authors = ["Your Name"]
+
+[dependencies]
+"#,
+        name
+    );
+    fs::write(project_dir.join("lopy.toml"), toml_content).expect("Failed to write lopy.toml");
+
+    // src/main.lp
+    let main_content = r#"функция главная() {
+    вывод("Hello, LopyLang! 🦎");
+}
+"#;
+    fs::write(project_dir.join("src/main.lp"), main_content).expect("Failed to write main.lp");
+
+    println!("✅ Проект {} создан!", name);
+    println!("📁 cd {}", name);
+    println!("🚀 lopy run");
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    cache::ensure_dirs();
+    ensure_tools();
+
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            "clean" => { handle_clean(); return; }
+            "build" => { handle_build(); return; }
+            "run" => { handle_run(); return; }
+            "create" => {
+                handle_create(&args[2..]);
+                return;
+            }
+            "pkg" => {
+                if args.len() < 3 {
+                    eprintln!("Использование: lopy pkg <add|remove|list> [name] [url]");
+                    std::process::exit(1);
+                }
+                handle_pkg(&args[2..]);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if args.len() < 2 {
+        eprintln!("Использование: lopy <файл.lp> [--run]");
+        eprintln!("           lopy clean");
+        eprintln!("           lopy build");
+        eprintln!("           lopy run");
+        eprintln!("           lopy pkg <add|remove|list>");
+        std::process::exit(1);
+    }
+
+    let filename = &args[1];
+    let should_run = args.contains(&"--run".to_string());
+
+    let out_name = Path::new(filename)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    if let Err(e) = compile_file(filename, &out_name, should_run, Vec::new(), Vec::new()) {
+        eprintln!("❌ Ошибка компиляции: {}", e);
+        std::process::exit(1);
     }
 }

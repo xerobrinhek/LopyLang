@@ -1,6 +1,17 @@
 use crate::ast::*;
-use std::collections::HashMap;
 use crate::{Lexer, Parser, TokenKind};
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+static C_SIGNATURES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+pub fn set_c_signatures(sig: HashMap<String, String>) {
+    let _ = C_SIGNATURES.set(sig);
+}
+
+fn get_c_signature(func: &str) -> Option<String> {
+    C_SIGNATURES.get().and_then(|map| map.get(func).cloned())
+}
 
 pub fn generate(program: &mut Program) -> String {
     let mut ir = String::new();
@@ -22,6 +33,9 @@ pub fn generate(program: &mut Program) -> String {
     ir.push_str("declare i8* @fgets(i8*, i32, i8*)\n\n");
     ir.push_str("declare i64 @llvm.readcyclecounter()\n");
     ir.push_str("declare void @pthread_exit(ptr)\n");
+    ir.push_str("declare void @setbuf(i8*, i8*)\n");
+    ir.push_str("declare void @free(i8*)\n");
+    ir.push_str("declare i8* @__acrt_iob_func(i32)\n");
 
     ir.push_str("@.str.true_val = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n");
     ir.push_str("@.str.false_val = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n");
@@ -31,8 +45,12 @@ pub fn generate(program: &mut Program) -> String {
     ir.push_str("@.str.string_fmt_clean = private unnamed_addr constant [8 x i8] c\" %[^\\n]\\00\", align 1\n");
     ir.push_str("@.input_error_int = private unnamed_addr constant [25 x i8] c\"Error: expected integer\\0A\\00\", align 1\n");
     ir.push_str("@.input_error_bool = private unnamed_addr constant [31 x i8] c\"Error: expected true or false\\0A\\00\", align 1\n");
-    ir.push_str("%struct._IO_FILE = type { i32, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i32, i32, i32, i16, i8, [1 x i8], i8*, i64, i8*, i8*, i8*, i8*, i32, i32, i32, i32, i16, i8, [1 x i8], i8*, i64, i32, i32, i32, i32, i32, i32, i32, i32, i8*, i64, i8*, i64, i32, i32, i32, i32 }\n");
-    ir.push_str("@stdin = external global %struct._IO_FILE*\n\n");
+
+    #[cfg(target_os = "windows")]
+    {
+        ir.push_str("declare i32 @SetConsoleOutputCP(i32)\n");
+        ir.push_str("declare i32 @SetConsoleCP(i32)\n");
+    }
 
     for class in &mut program.classes {
         let has_constructor = class.methods.iter().any(|m| m.is_constructor);
@@ -166,13 +184,25 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
     let mut ir = String::new();
     let mut var_types: HashMap<String, (String, String)> = HashMap::new();
 
-    let ret_type = llvm_type(&func.return_type);
+    let ret_type = if func.name == "main" {
+        "i32".to_string()
+    } else {
+        llvm_type(&func.return_type)
+    };
     ir.push_str(&format!("define {} @{}(", ret_type, mangle_name(&func.name)));
     for (i, (_, t)) in func.params.iter().enumerate() {
         if i > 0 { ir.push_str(", "); }
         ir.push_str(&llvm_type(t));
     }
     ir.push_str(") {\n");
+
+    if func.name == "main" {
+        #[cfg(target_os = "windows")]
+        {
+            ir.push_str("  call i32 @SetConsoleOutputCP(i32 65001)\n");
+            ir.push_str("  call i32 @SetConsoleCP(i32 65001)\n");
+        }
+    }
 
     let mut param_counter = 0;
     for (name, t) in &func.params {
@@ -190,13 +220,10 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
         ir.push_str(&generate_statement(program, stmt, &mut temp_counter, &mut var_types, string_counter, strings, None));
     }
 
-    if func.return_type == Type::Void {
-        if func.name == "main" {
-            ir.push_str("  call void @pthread_exit(ptr null)\n");
-            ir.push_str("  unreachable\n");
-        } else {
-            ir.push_str("  ret void\n");
-        }
+    if func.name == "main" {
+        ir.push_str("  ret i32 0\n");
+    } else if func.return_type == Type::Void {
+        ir.push_str("  ret void\n");
     }
     ir.push_str("}\n\n");
     ir
@@ -205,7 +232,10 @@ fn generate_function(program: &Program, func: &Function, string_counter: &mut us
 fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut usize, var_types: &mut HashMap<String, (String, String)>, string_counter: &mut usize, strings: &mut String, current_class: Option<&Class>) -> String {
     match stmt {
         Statement::Let { name, type_, value } => {
-            let (val_ir, val_reg, val_type) = generate_expression(program, value, temp_counter, string_counter, strings, var_types, current_class);
+            let (val_ir, val_reg, val_type, _) = generate_expression(program, value, temp_counter, string_counter, strings, var_types, current_class);
+            if val_type == "void" {
+                panic!("Невозможно присвоить void в переменную {} на строке", name);
+            }
             let llvm_t = match type_ {
                 Some(t) => llvm_type(t),
                 None => val_type.clone(),
@@ -215,31 +245,38 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             let alloca = format!("  {} = alloca {}\n", var_alloca, llvm_t);
             let store = format!("  store {} {}, {}* {}\n", val_type, val_reg, llvm_t, var_alloca);
             var_types.insert(name.clone(), (var_alloca, llvm_t));
+
             format!("{}{}{}", val_ir, alloca, store)
         }
         Statement::Return { value } => {
             match value {
                 Some(expr) => {
-                    let (val_ir, val_reg, val_type) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+                    let (val_ir, val_reg, val_type, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
                     format!("{}  ret {} {}\n", val_ir, val_type, val_reg)
                 }
                 None => "  ret void\n".to_string(),
             }
         }
         Statement::Expr(expr) => {
-            let (ir, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+            let (ir, reg, typ, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
             ir
         }
         Statement::Println { values } => {
             let mut ir = String::new();
             let mut regs = Vec::new();
             let mut types = Vec::new();
+            let mut temp_strings = Vec::new();
+
             for value in values {
-                let (val_ir, val_reg, val_type) = generate_expression(program, value, temp_counter, string_counter, strings, var_types, current_class);
+                let (val_ir, val_reg, val_type, is_dynamic) = generate_expression(program, value, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&val_ir);
-                regs.push(val_reg);
+                regs.push(val_reg.clone());
                 types.push(val_type);
+                if is_dynamic {
+                    temp_strings.push(val_reg);
+                }
             }
+
             let fmt_parts: Vec<String> = types.iter().map(|t| if t == "i8*" { "%s" } else { "%lld" }).map(|s| s.to_string()).collect();
             let fmt_str = fmt_parts.join(" ");
             let fmt_len = fmt_str.len() + 2;
@@ -253,16 +290,22 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             let fmt_store = format!("  store [{} x i8] c\"{}\\0A\\00\", [{} x i8]* {}\n", fmt_len, fmt_str, fmt_len, fmt_name);
             let fmt_ptr = format!("  {} = getelementptr [{} x i8], [{} x i8]* {}, i32 0, i32 0\n", fmt_ptr_name, fmt_len, fmt_len, fmt_name);
             let args: Vec<String> = regs.iter().zip(types.iter()).map(|(r, t)| format!("{} {}", t, r)).collect();
+
             let call_ir = format!("  call i32 (i8*, ...) @printf(i8* {}, {})\n", fmt_ptr_name, args.join(", "));
 
             ir.push_str(&fmt_alloca);
             ir.push_str(&fmt_store);
             ir.push_str(&fmt_ptr);
             ir.push_str(&call_ir);
+            
+            for reg in &temp_strings {
+                ir.push_str(&format!("  call void @free(i8* {})\n", reg));
+            }
+
             ir
         }
         Statement::If { condition, then_body, else_body } => {
-            let (cond_ir, cond_reg, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
+            let (cond_ir, cond_reg, _, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = cond_ir;
             let then_label = format!(".then{}", *temp_counter);
             let else_label = format!(".else{}", *temp_counter);
@@ -308,7 +351,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             ir.push_str(&format!("  br label %{}\n", start_label));
             ir.push_str(&format!("{}:\n", start_label));
 
-            let (cond_ir, cond_reg, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
+            let (cond_ir, cond_reg, _, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
             ir.push_str(&cond_ir);
 
             let cmp_reg = format!("%cmp{}", *temp_counter);
@@ -336,7 +379,7 @@ fn generate_statement(program: &Program, stmt: &Statement, temp_counter: &mut us
             ir.push_str(&format!("  br label %{}\n", start_label));
             ir.push_str(&format!("{}:\n", start_label));
 
-            let (cond_ir, cond_reg, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
+            let (cond_ir, cond_reg, _, _) = generate_expression(program, condition, temp_counter, string_counter, strings, var_types, current_class);
             ir.push_str(&cond_ir);
 
             let cmp_reg = format!("%cmp{}", *temp_counter);
@@ -369,6 +412,7 @@ fn get_struct_size(class_name: &str, program: &Program) -> usize {
             Type::Bool => (1, 1),
             Type::Class(_) => (8, 8),
             Type::Void => (0, 8),
+            Type::Func => (8, 8),
         };
         max_align = max_align.max(align);
         if offset % align != 0 {
@@ -399,9 +443,9 @@ fn block_always_returns(body: &[Statement]) -> bool {
     }
 }
 
-fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut usize, string_counter: &mut usize, strings: &mut String, var_types: &HashMap<String, (String, String)>, current_class: Option<&Class>) -> (String, String, String) {
+fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut usize, string_counter: &mut usize, strings: &mut String, var_types: &HashMap<String, (String, String)>, current_class: Option<&Class>) -> (String, String, String, bool) {
     match expr {
-        Expression::Number(n) => (String::new(), n.to_string(), "i128".to_string()),
+        Expression::Number(n) => (String::new(), n.to_string(), "i128".to_string(), false),
         Expression::StringLit(s) => {
             let label = format!(".str{}", *string_counter);
             *string_counter += 1;
@@ -440,25 +484,30 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let len = char_count + 1;
             strings.push_str(&format!("@{} = private unnamed_addr constant [{} x i8] c\"{}\\00\", align 1\n", label, len, escaped));
             let ptr = format!("getelementptr inbounds ([{} x i8], [{} x i8]* @{}, i32 0, i32 0)", len, len, label);
-            (String::new(), ptr, "i8*".to_string())
+            (String::new(), ptr, "i8*".to_string(), false)
         }
         Expression::Variable(name) => {
             let (var_name, var_type) = var_types.get(name).cloned().unwrap_or_else(|| panic!("Variable '{}' not found", name));
-            let reg = format!("%t{}", *temp_counter);
-            *temp_counter += 1;
-            let ir = format!("  {} = load {}, {}* {}\n", reg, var_type, var_type, var_name);
-            (ir, reg, var_type)
+            let is_loaded = var_name.starts_with("%val_") || var_name.starts_with("%capture_");
+            if is_loaded {
+                (String::new(), var_name, var_type, false)
+            } else {
+                let reg = format!("%t{}", *temp_counter);
+                *temp_counter += 1;
+                let ir = format!("  {} = load {}, {}* {}\n", reg, var_type, var_type, var_name);
+                (ir, reg, var_type, false)
+            }
         }
         Expression::This => {
             let (this_name, this_type) = var_types.get("this").cloned().unwrap_or_else(|| panic!("'this' used outside of method"));
             let reg = format!("%t{}", *temp_counter);
             *temp_counter += 1;
             let ir = format!("  {} = load {}, {}* {}\n", reg, this_type, this_type, this_name);
-            (ir, reg, this_type)
+            (ir, reg, this_type, false)
         }
         Expression::BinaryOp { left, op, right } => {
-            let (left_ir, left_reg, left_type) = generate_expression(program, left, temp_counter, string_counter, strings, var_types, current_class);
-            let (right_ir, right_reg, right_type) = generate_expression(program, right, temp_counter, string_counter, strings, var_types, current_class);
+            let (left_ir, left_reg, left_type, _) = generate_expression(program, left, temp_counter, string_counter, strings, var_types, current_class);
+            let (right_ir, right_reg, right_type, _) = generate_expression(program, right, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = format!("{}{}", left_ir, right_ir);
 
             if matches!(op, BinaryOperator::Add) {
@@ -469,6 +518,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let total_len_with_null = format!("%total_len_with_null{}", *temp_counter);
                     let ptr = format!("%concat_ptr{}", *temp_counter);
                     *temp_counter += 5;
+
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_left, left_reg));
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_right, right_reg));
                     ir.push_str(&format!("  {} = add i64 {}, {}\n", total_len, len_left, len_right));
@@ -476,13 +526,14 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr, total_len_with_null));
                     ir.push_str(&format!("  call i8* @strcpy(i8* {}, i8* {})\n", ptr, left_reg));
                     ir.push_str(&format!("  call i8* @strcat(i8* {}, i8* {})\n", ptr, right_reg));
-                    return (ir, ptr, "i8*".to_string());
+
+                    return (ir, ptr, "i8*".to_string(), true);
                 }
 
                 if left_type == "i128" && right_type == "i8*" {
                     let num_str = format!("%num_str{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = alloca i8, i64 39\n", num_str));
+                    ir.push_str(&format!("  {} = call i8* @malloc(i64 39)\n", num_str));
                     ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.str.num_fmt, i32 0, i32 0), i128 {})\n", num_str, left_reg));
 
                     let len_left = format!("%len_left{}", *temp_counter);
@@ -491,6 +542,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let total_len_with_null = format!("%total_len_with_null{}", *temp_counter);
                     let ptr = format!("%concat_ptr{}", *temp_counter);
                     *temp_counter += 5;
+
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_left, num_str));
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_right, right_reg));
                     ir.push_str(&format!("  {} = add i64 {}, {}\n", total_len, len_left, len_right));
@@ -498,13 +550,16 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr, total_len_with_null));
                     ir.push_str(&format!("  call i8* @strcpy(i8* {}, i8* {})\n", ptr, num_str));
                     ir.push_str(&format!("  call i8* @strcat(i8* {}, i8* {})\n", ptr, right_reg));
-                    return (ir, ptr, "i8*".to_string());
+
+                    ir.push_str(&format!("  call void @free(i8* {})\n", num_str));
+
+                    return (ir, ptr, "i8*".to_string(), true);
                 }
 
                 if left_type == "i8*" && right_type == "i128" {
                     let num_str = format!("%num_str{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = alloca i8, i64 39\n", num_str));
+                    ir.push_str(&format!("  {} = call i8* @malloc(i64 39)\n", num_str));
                     ir.push_str(&format!("  call i32 (i8*, i8*, ...) @sprintf(i8* {}, i8* getelementptr inbounds ([5 x i8], [5 x i8]* @.str.num_fmt, i32 0, i32 0), i128 {})\n", num_str, right_reg));
 
                     let len_left = format!("%len_left{}", *temp_counter);
@@ -513,6 +568,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let total_len_with_null = format!("%total_len_with_null{}", *temp_counter);
                     let ptr = format!("%concat_ptr{}", *temp_counter);
                     *temp_counter += 5;
+
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_left, left_reg));
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len_right, num_str));
                     ir.push_str(&format!("  {} = add i64 {}, {}\n", total_len, len_left, len_right));
@@ -520,7 +576,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", ptr, total_len_with_null));
                     ir.push_str(&format!("  call i8* @strcpy(i8* {}, i8* {})\n", ptr, left_reg));
                     ir.push_str(&format!("  call i8* @strcat(i8* {}, i8* {})\n", ptr, num_str));
-                    return (ir, ptr, "i8*".to_string());
+
+                    ir.push_str(&format!("  call void @free(i8* {})\n", num_str));
+
+                    return (ir, ptr, "i8*".to_string(), true);
                 }
             }
 
@@ -545,7 +604,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     }
                     _ => {}
                 }
-                return (ir, result_reg, "i128".to_string());
+                return (ir, result_reg, "i128".to_string(), false);
             }
 
             let result_reg = format!("%t{}", *temp_counter);
@@ -591,8 +650,11 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  {} = icmp sge i128 {}, {}\n", cmp, left_reg, right_reg));
                     ir.push_str(&format!("  {} = zext i1 {} to i128\n", result_reg, cmp));
                 }
+                BinaryOperator::Rem => {
+                    ir.push_str(&format!("  {} = srem i128 {}, {}\n", result_reg, left_reg, right_reg));
+                }
             }
-            (ir, result_reg, "i128".to_string())
+            (ir, result_reg, "i128".to_string(), false)
         }
         Expression::Call { func, args } => {
             let mut ir = String::new();
@@ -600,7 +662,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let mut arg_types = Vec::new();
 
             for arg in args {
-                let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
+                let (arg_ir, arg_reg, arg_type, _) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&arg_ir);
                 arg_regs.push(arg_reg);
                 arg_types.push(arg_type);
@@ -611,28 +673,28 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 let ret_type = llvm_type(&f.return_type);
                 if f.return_type == Type::Void {
                     ir.push_str(&format!("  call {} @{}({})\n", ret_type, mangle_name(func), args_str.join(", ")));
-                    (ir, String::new(), ret_type)
+                    (ir, String::new(), ret_type, false)
                 } else {
                     let call_reg = format!("%t{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, mangle_name(func), args_str.join(", ")));
-                    (ir, call_reg, ret_type)
+                    (ir, call_reg, ret_type, false)
                 }
             } else {
                 let call_reg = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call i128 @{}({})\n", call_reg, mangle_name(func), args_str.join(", ")));
-                (ir, call_reg, "i128".to_string())
+                (ir, call_reg, "i128".to_string(), false)
             }
         }
         Expression::MethodCall { object, method, args } => {
-            let (obj_ir, obj_reg, obj_type) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
+            let (obj_ir, obj_reg, obj_type, _) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = obj_ir;
             let mut arg_regs = vec![obj_reg.clone()];
             let mut arg_types = vec![obj_type.clone()];
 
             for arg in args {
-                let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
+                let (arg_ir, arg_reg, arg_type, _) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&arg_ir);
                 arg_regs.push(arg_reg);
                 arg_types.push(arg_type);
@@ -642,22 +704,28 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let mangled_class = mangle_name(class_name);
             let mangled_method = mangle_name(method);
             let llvm_method = format!("{}_{}", mangled_class, mangled_method);
-            let args_str: Vec<String> = arg_regs.iter().zip(arg_types.iter()).map(|(r, t)| format!("{} {}", t, r)).collect();
+
+            let args_str: Vec<String> = arg_regs.iter().zip(arg_types.iter())
+                .map(|(r, t)| format!("{} {}", t, r))
+                .collect();
 
             let method_def = program.classes.iter()
                 .find(|c| c.name == class_name)
                 .and_then(|c| c.methods.iter().find(|m| m.name == *method))
-                .unwrap();
+                .unwrap_or_else(|| {
+                    panic!("Method '{}' not found in class '{}'", method, class_name);
+                });
+
             let ret_type = llvm_type(&method_def.return_type);
 
             if method_def.return_type == Type::Void {
                 ir.push_str(&format!("  call {} @{}({})\n", ret_type, llvm_method, args_str.join(", ")));
-                (ir, String::new(), ret_type)
+                (ir, String::new(), "void".to_string(), false)
             } else {
                 let call_reg = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, llvm_method, args_str.join(", ")));
-                (ir, call_reg, ret_type)
+                (ir, call_reg, ret_type, false)
             }
         }
         Expression::New { class, args } => {
@@ -683,16 +751,17 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
 
             let mut constructor_args = vec![format!("%{}* {}", mangled_class, obj_ptr)];
             for arg in args {
-                let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
+                let (arg_ir, arg_reg, arg_type, _) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&arg_ir);
                 constructor_args.push(format!("{} {}", arg_type, arg_reg));
             }
 
             ir.push_str(&format!("  {} = call %{}* @{}({})\n", init_reg, mangled_class, constructor_name, constructor_args.join(", ")));
-            (ir, init_reg, format!("%{}*", mangled_class))
+
+            (ir, init_reg, format!("%{}*", mangled_class), false)
         }
         Expression::FieldAccess { object, field } => {
-            let (obj_ir, obj_reg, obj_type) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
+            let (obj_ir, obj_reg, obj_type, _) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = obj_ir;
             let class_name = obj_type.trim_start_matches('%').trim_end_matches('*');
             let mangled_class = mangle_name(class_name);
@@ -706,19 +775,19 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let val_reg = format!("%t{}", *temp_counter);
             *temp_counter += 1;
             ir.push_str(&format!("  {} = load {}, {}* {}\n", val_reg, field_type, field_type, field_ptr));
-            (ir, val_reg, field_type)
+            (ir, val_reg, field_type, false)
         }
         Expression::Assignment { left, right } => {
-            let (right_ir, right_reg, right_type) = generate_expression(program, right, temp_counter, string_counter, strings, var_types, current_class);
+            let (right_ir, right_reg, right_type, _) = generate_expression(program, right, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = right_ir;
             match left.as_ref() {
                 Expression::Variable(name) => {
                     let (var_name, var_type) = var_types.get(name).unwrap();
                     ir.push_str(&format!("  store {} {}, {}* {}\n", right_type, right_reg, var_type, var_name));
-                    (ir, right_reg, right_type)
+                    (ir, right_reg, right_type, false)
                 }
                 Expression::FieldAccess { object, field } => {
-                    let (obj_ir, obj_reg, obj_type) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
+                    let (obj_ir, obj_reg, obj_type, _) = generate_expression(program, object, temp_counter, string_counter, strings, var_types, current_class);
                     ir.push_str(&obj_ir);
                     let class_name = obj_type.trim_start_matches('%').trim_end_matches('*');
                     let mangled_class = mangle_name(class_name);
@@ -730,7 +799,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = getelementptr %{}, %{}* {}, i32 0, i32 {}\n", field_ptr, mangled_class, mangled_class, obj_reg, index));
                     ir.push_str(&format!("  store {} {}, {}* {}\n", right_type, right_reg, field_type, field_ptr));
-                    (ir, right_reg, right_type)
+                    (ir, right_reg, right_type, false)
                 }
                 _ => panic!("Invalid assignment target"),
             }
@@ -745,10 +814,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let buf_reg = format!("%buf{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = alloca i8, i64 256\n", buf_reg));
-                    let stdin_ptr = format!("%stdin_ptr_{}", *temp_counter);
+                    let stdin_file = format!("%stdin_file{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = load %struct._IO_FILE*, %struct._IO_FILE** @stdin\n", stdin_ptr));
-                    ir.push_str(&format!("  call i8* @fgets(i8* {}, i32 256, i8* {})\n", buf_reg, stdin_ptr));
+                    ir.push_str(&format!("  {} = call i8* @__acrt_iob_func(i32 0)\n", stdin_file));
+                    ir.push_str(&format!("  call i8* @fgets(i8* {}, i32 256, i8* {})\n", buf_reg, stdin_file));
                     let len = format!("%len{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len, buf_reg));
@@ -769,16 +838,16 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     ir.push_str(&format!("  store i8 0, i8* {}\n", ptr));
                     ir.push_str(&format!("  br label %{}\n", end_label));
                     ir.push_str(&format!("{}:\n", end_label));
-                    (ir, buf_reg, "i8*".to_string())
+                    (ir, buf_reg, "i8*".to_string(), false)
                 }
                 InputType::Int => {
                     let buf_reg = format!("%buf{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = alloca i8, i64 256\n", buf_reg));
-                    let stdin_ptr = format!("%stdin_ptr_{}", *temp_counter);
+                    let stdin_file = format!("%stdin_file{}", *temp_counter);
                     *temp_counter += 1;
-                    ir.push_str(&format!("  {} = load %struct._IO_FILE*, %struct._IO_FILE** @stdin\n", stdin_ptr));
-                    ir.push_str(&format!("  call i8* @fgets(i8* {}, i32 256, i8* {})\n", buf_reg, stdin_ptr));
+                    ir.push_str(&format!("  {} = call i8* @__acrt_iob_func(i32 0)\n", stdin_file));
+                    ir.push_str(&format!("  call i8* @fgets(i8* {}, i32 256, i8* {})\n", buf_reg, stdin_file));
                     let len = format!("%len{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = call i64 @strlen(i8* {})\n", len, buf_reg));
@@ -824,7 +893,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let conv = format!("%conv{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = sext i64 {} to i128\n", conv, num));
-                    (ir, conv, "i128".to_string())
+                    (ir, conv, "i128".to_string(), false)
                 }
                 InputType::Bool => {
                     let buf_reg = format!("%buf{}", *temp_counter);
@@ -869,7 +938,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                     let conv_reg = format!("%t{}", *temp_counter);
                     *temp_counter += 1;
                     ir.push_str(&format!("  {} = sext i32 {} to i128\n", conv_reg, buf_reg));
-                    (ir, conv_reg, "i128".to_string())
+                    (ir, conv_reg, "i128".to_string(), false)
                 }
             }
         }
@@ -922,7 +991,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             ir.push_str(&format!("  {} = sdiv i128 {}, 65536\n", rand_val, add_result));
 
             if let Some(max_expr) = max {
-                let (max_ir, max_reg, _) = generate_expression(program, max_expr, temp_counter, string_counter, strings, var_types, current_class);
+                let (max_ir, max_reg, _, _) = generate_expression(program, max_expr, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&max_ir);
                 let srem_result = format!("%srem{}", *temp_counter);
                 *temp_counter += 1;
@@ -930,9 +999,9 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = srem i128 {}, {}\n", srem_result, rand_val, max_reg));
                 ir.push_str(&format!("  {} = add i128 {}, 1\n", final_result, srem_result));
-                (ir, final_result, "i128".to_string())
+                (ir, final_result, "i128".to_string(), false)
             } else {
-                (ir, rand_val, "i128".to_string())
+                (ir, rand_val, "i128".to_string(), false)
             }
         }
         Expression::CrCall { func, args } => {
@@ -941,7 +1010,7 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let mut arg_types = Vec::new();
 
             for arg in args {
-                let (arg_ir, arg_reg, arg_type) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
+                let (arg_ir, arg_reg, arg_type, _) = generate_expression(program, arg, temp_counter, string_counter, strings, var_types, current_class);
                 ir.push_str(&arg_ir);
                 arg_regs.push(arg_reg);
                 arg_types.push(arg_type);
@@ -949,10 +1018,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
 
             let args_str: Vec<String> = arg_regs.iter().zip(arg_types.iter()).map(|(r, t)| format!("{} {}", t, r)).collect();
 
-            let ret_type = if func == "create_window" || func == "window_should_close" {
-                "i128"
+            let ret_type = if let Some(sig) = get_c_signature(&func) {
+                sig
             } else {
-                "void"
+                "void".to_string()
             };
 
             let mut declare_args = Vec::new();
@@ -971,16 +1040,16 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
 
             if ret_type == "void" {
                 ir.push_str(&format!("  call {} @{}({})\n", ret_type, func, args_str.join(", ")));
-                (ir, String::new(), "void".to_string())
+                (ir, String::new(), "void".to_string(), false)
             } else {
                 let call_reg = format!("%t{}", *temp_counter);
                 *temp_counter += 1;
                 ir.push_str(&format!("  {} = call {} @{}({})\n", call_reg, ret_type, func, args_str.join(", ")));
-                (ir, call_reg, ret_type.to_string())
+                (ir, call_reg, ret_type.to_string(), false)
             }
         }
         Expression::Not(expr) => {
-            let (ir, reg, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+            let (ir, reg, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
             let result = format!("%t{}", *temp_counter);
             *temp_counter += 1;
             let cmp = format!("%cmp{}", *temp_counter);
@@ -988,10 +1057,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             let mut new_ir = ir;
             new_ir.push_str(&format!("  {} = icmp eq i128 {}, 0\n", cmp, reg));
             new_ir.push_str(&format!("  {} = zext i1 {} to i128\n", result, cmp));
-            (new_ir, result, "i128".to_string())
+            (new_ir, result, "i128".to_string(), false)
         }
         Expression::Thread { obj, code } => {
-            let (obj_ir, obj_reg, obj_type) = generate_expression(program, obj, temp_counter, string_counter, strings, var_types, current_class);
+            let (obj_ir, obj_reg, obj_type, _) = generate_expression(program, obj, temp_counter, string_counter, strings, var_types, current_class);
             let mut ir = obj_ir;
 
             let thread_id = *string_counter;
@@ -1007,10 +1076,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             ir.push_str(&format!("  {} = call i64 @thread_create(i8* {}, i8* (i8*)* {})\n",
                                  thread_handle, obj_reg, wrapper_name));
 
-            (ir, thread_handle, "i64".to_string())
+            (ir, thread_handle, "i64".to_string(), false)
         }
         Expression::PostInc(expr) => {
-            let (mut ir, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+            let (mut ir, _, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
 
             let var_name = match expr.as_ref() {
                 Expression::Variable(name) => name,
@@ -1027,10 +1096,10 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             ir.push_str(&format!("  {} = add i128 {}, 1\n", new_val, old_val));
             ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
 
-            (ir, old_val, "i128".to_string())
+            (ir, old_val, "i128".to_string(), false)
         }
         Expression::PostDec(expr) => {
-            let (mut ir, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
+            let (mut ir, _, _, _) = generate_expression(program, expr, temp_counter, string_counter, strings, var_types, current_class);
 
             let var_name = match expr.as_ref() {
                 Expression::Variable(name) => name,
@@ -1047,8 +1116,178 @@ fn generate_expression(program: &Program, expr: &Expression, temp_counter: &mut 
             ir.push_str(&format!("  {} = sub i128 {}, 1\n", new_val, old_val));
             ir.push_str(&format!("  store i128 {}, i128* {}\n", new_val, var_ptr));
 
-            (ir, old_val, "i128".to_string())
+            (ir, old_val, "i128".to_string(), false)
         }
+        Expression::Lambda { body } => {
+            let mut captures = Vec::new();
+            collect_captures(body, var_types, &mut captures);
+            captures.sort();
+            captures.dedup();
+
+            let lambda_id = *temp_counter;
+            *temp_counter += 1;
+            let func_name = format!("__lambda_{}", lambda_id);
+
+            let closure_c_type = format!("%closure_c_{}", lambda_id);
+            strings.push_str(&format!("{} = type {{ i8*, i8* }}\n", closure_c_type));
+
+            let mut lambda_ir = String::new();
+            lambda_ir.push_str(&format!("define void @{}(i8* %ctx) {{\n", func_name));
+
+            let mut lambda_var_types = HashMap::new();
+
+            if !captures.is_empty() {
+                let closure_type = format!("%closure_data_{}", lambda_id);
+                let fields: Vec<String> = captures.iter()
+                    .map(|(_, var_type)| var_type.clone())
+                    .collect();
+                strings.push_str(&format!("{} = type {{ {}}}\n", closure_type, fields.join(", ")));
+
+                lambda_ir.push_str(&format!("  %data = bitcast i8* %ctx to {}*\n", closure_type));
+                for (i, (name, var_type)) in captures.iter().enumerate() {
+                    let ptr = format!("%capture_{}_{}", name, i);
+                    let val = format!("%val_{}_{}", name, i);
+                    lambda_ir.push_str(&format!("  {} = getelementptr {}, {}* %data, i32 0, i32 {}\n", ptr, closure_type, closure_type, i));
+                    lambda_ir.push_str(&format!("  {} = load {}, {}* {}\n", val, var_type, var_type, ptr));
+                    lambda_var_types.insert(name.clone(), (val, var_type.clone()));
+                }
+            }
+
+            for stmt in body {
+                lambda_ir.push_str(&generate_statement(
+                    program,
+                    stmt,
+                    temp_counter,
+                    &mut lambda_var_types,
+                    string_counter,
+                    strings,
+                    current_class
+                ));
+            }
+            lambda_ir.push_str("  ret void\n");
+            lambda_ir.push_str("}\n");
+            strings.push_str(&lambda_ir);
+
+            let mut ir = String::new();
+
+            let closure_c_ptr = format!("%closure_c_ptr_{}", lambda_id);
+            ir.push_str(&format!("  {} = call i8* @malloc(i64 16)\n", closure_c_ptr));
+            let closure_c_typed = format!("%closure_c_typed_{}", lambda_id);
+            ir.push_str(&format!("  {} = bitcast i8* {} to {}*\n", closure_c_typed, closure_c_ptr, closure_c_type));
+
+            let func_ptr_field = format!("%func_ptr_field_{}", lambda_id);
+            ir.push_str(&format!("  {} = getelementptr {}, {}* {}, i32 0, i32 0\n", func_ptr_field, closure_c_type, closure_c_type, closure_c_typed));
+            let func_ptr = format!("bitcast (void (i8*)* @{} to i8*)", func_name);
+            ir.push_str(&format!("  store i8* {}, i8** {}\n", func_ptr, func_ptr_field));
+
+            if captures.is_empty() {
+                let data_field = format!("%data_field_{}", lambda_id);
+                ir.push_str(&format!("  {} = getelementptr {}, {}* {}, i32 0, i32 1\n", data_field, closure_c_type, closure_c_type, closure_c_typed));
+                ir.push_str(&format!("  store i8* null, i8** {}\n", data_field));
+            } else {
+                let data_type = format!("%closure_data_{}", lambda_id);
+                let data_size = captures.len() * 8;
+                let data_ptr = format!("%data_ptr_{}", lambda_id);
+                ir.push_str(&format!("  {} = call i8* @malloc(i64 {})\n", data_ptr, data_size));
+                let data_typed = format!("%data_typed_{}", lambda_id);
+                ir.push_str(&format!("  {} = bitcast i8* {} to {}*\n", data_typed, data_ptr, data_type));
+
+                for (i, (name, var_type)) in captures.iter().enumerate() {
+                    let field_ptr = format!("%field_{}_{}", name, i);
+                    ir.push_str(&format!("  {} = getelementptr {}, {}* {}, i32 0, i32 {}\n", field_ptr, data_type, data_type, data_typed, i));
+                    let (var_name, _) = var_types.get(name).unwrap();
+                    let val_reg = format!("%t{}", *temp_counter);
+                    *temp_counter += 1;
+                    ir.push_str(&format!("  {} = load {}, {}* {}\n", val_reg, var_type, var_type, var_name));
+
+                    ir.push_str(&format!("  store {} {}, {}* {}\n", var_type, val_reg, var_type, field_ptr));
+                }
+
+                let data_field = format!("%data_field_{}", lambda_id);
+                ir.push_str(&format!("  {} = getelementptr {}, {}* {}, i32 0, i32 1\n", data_field, closure_c_type, closure_c_type, closure_c_typed));
+                ir.push_str(&format!("  store i8* {}, i8** {}\n", data_ptr, data_field));
+            }
+
+            (ir, closure_c_ptr, "i8*".to_string(), false)
+        }
+    }
+}
+
+fn collect_captures(stmts: &[Statement], var_types: &HashMap<String, (String, String)>, captures: &mut Vec<(String, String)>) {
+    for stmt in stmts {
+        match stmt {
+            Statement::Let { value, .. } => {
+                collect_captures_expr(value, var_types, captures);
+            }
+            Statement::Return { value } => {
+                if let Some(expr) = value {
+                    collect_captures_expr(expr, var_types, captures);
+                }
+            }
+            Statement::Expr(expr) => {
+                collect_captures_expr(expr, var_types, captures);
+            }
+            Statement::Println { values } => {
+                for value in values {
+                    collect_captures_expr(value, var_types, captures);
+                }
+            }
+            Statement::If { condition, then_body, else_body } => {
+                collect_captures_expr(condition, var_types, captures);
+                collect_captures(then_body, var_types, captures);
+                if let Some(else_body) = else_body {
+                    collect_captures(else_body, var_types, captures);
+                }
+            }
+            Statement::While { condition, body } => {
+                collect_captures_expr(condition, var_types, captures);
+                collect_captures(body, var_types, captures);
+            }
+            Statement::For { init, condition, increment, body } => {
+                collect_captures(std::slice::from_ref(init.as_ref()), var_types, captures);
+                collect_captures_expr(condition, var_types, captures);
+                collect_captures(std::slice::from_ref(increment.as_ref()), var_types, captures);
+                collect_captures(body, var_types, captures);
+            }
+        }
+    }
+}
+
+fn collect_captures_expr(expr: &Expression, var_types: &HashMap<String, (String, String)>, captures: &mut Vec<(String, String)>) {
+    match expr {
+        Expression::Variable(name) => {
+            if let Some((_, var_type)) = var_types.get(name) {
+                if name != "this" {
+                    captures.push((name.clone(), var_type.clone()));
+                }
+            }
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            collect_captures_expr(left, var_types, captures);
+            collect_captures_expr(right, var_types, captures);
+        }
+        Expression::Call { args, .. } => {
+            for arg in args {
+                collect_captures_expr(arg, var_types, captures);
+            }
+        }
+        Expression::MethodCall { object, args, .. } => {
+            collect_captures_expr(object, var_types, captures);
+            for arg in args {
+                collect_captures_expr(arg, var_types, captures);
+            }
+        }
+        Expression::FieldAccess { object, .. } => {
+            collect_captures_expr(object, var_types, captures);
+        }
+        Expression::Assignment { left, right } => {
+            collect_captures_expr(left, var_types, captures);
+            collect_captures_expr(right, var_types, captures);
+        }
+        Expression::Not(expr) => {
+            collect_captures_expr(expr, var_types, captures);
+        }
+        _ => {}
     }
 }
 
@@ -1107,8 +1346,9 @@ fn llvm_type(t: &Type) -> String {
     match t {
         Type::Int => "i128".to_string(),
         Type::String => "i8*".to_string(),
-        Type::Bool => "i1".to_string(),
+        Type::Bool => "i128".to_string(),
         Type::Void => "void".to_string(),
         Type::Class(name) => format!("%{}*", mangle_name(name)),
+        Type::Func => "i8*".to_string(),
     }
 }

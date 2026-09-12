@@ -5,6 +5,7 @@ pub enum Type {
     Bool,
     Void,
     Class(String),
+    Func,
 }
 
 #[derive(Debug)]
@@ -107,10 +108,11 @@ pub enum Expression {
     },
     PostInc(Box<Expression>),
     PostDec(Box<Expression>),
+    Lambda { body: Vec<Statement> },
 }
 
 #[derive(Debug)]
 pub enum BinaryOperator {
     Add, Sub, Mul, Div,
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq, Ne, Lt, Le, Gt, Ge, Rem,
 }
